@@ -27,7 +27,7 @@ from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables._k_e_r_n import KernTable_format_0
 
 # Constants
-DEFAULT_PREFIX = "KoFi"
+DEFAULT_PREFIX = "KF"
 DEFAULT_LINE_PERCENT = 20
 VALID_SUFFIXES = ("-Regular", "-Bold", "-Italic", "-BoldItalic")
 SUPPORTED_EXTENSIONS = (".ttf", ".otf")
@@ -567,11 +567,6 @@ Examples:
         help=f"Line spacing adjustment percentage (default: {DEFAULT_LINE_PERCENT})"
     )
     parser.add_argument(
-        "--no-backup", 
-        action="store_true",
-        help="Don't create backup files before processing"
-    )
-    parser.add_argument(
         "--verbose", 
         action="store_true",
         help="Enable verbose output"
@@ -614,7 +609,6 @@ Examples:
         if processor.process_font(
             font_path, 
             args.name, 
-            backup=not args.no_backup
         ):
             success_count += 1
     

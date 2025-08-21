@@ -29,21 +29,35 @@ from typing import Dict, Tuple, Optional, List
 from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables._k_e_r_n import KernTable_format_0
 
-# Constants
+# -------------
+# DEFAULTS
+# -------------
+#
 DEFAULT_PREFIX = "KF"
 DEFAULT_LINE_PERCENT = 20
 
+# -------------
+# STYLE MAPPING
+# -------------
 # Style mapping for filenames and internal font data.
-# This centralized map is used as a single source of truth for all style-related
-# properties based on the font's filename.
-# The keys are substrings to check in the filename.
+# If a particular style string is found in the font file name, it can be mapped.
 # The values are a tuple of (human-readable_style_name, usWeightClass).
+#
 STYLE_MAP = {
     "BoldItalic": ("Bold Italic", 700),
     "Bold": ("Bold", 700),
     "Italic": ("Italic", 400),
     "Regular": ("Regular", 400),
 }
+
+# -------------
+# SUPPORTED EXTENSIONS
+# -------------
+# Sadly, due to issues, OTF files are not supported.
+# Not a big loss, given that Kobo plays well with TTF files, 
+# not so much with OTF files that have been modified by this
+# slightly bananas script.
+#
 SUPPORTED_EXTENSIONS = (".ttf")
 
 # Configure logging for clear output
@@ -55,7 +69,6 @@ logger = logging.getLogger(__name__)
 class FontMetadata:
     """
     A simple data class to hold consistent font naming and metadata.
-    This prevents passing multiple, potentially inconsistent strings between functions.
     """
     family_name: str
     style_name: str
@@ -65,13 +78,16 @@ class FontMetadata:
 
 class FontProcessor:
     """
-    Main font processing class. All core logic is encapsulated here to improve
-    readability and testability.
+    Main font processing class.
     """
     
-    def __init__(self, prefix: str = DEFAULT_PREFIX, line_percent: int = DEFAULT_LINE_PERCENT):
+    def __init__(self, 
+        prefix: str = DEFAULT_PREFIX, 
+        line_percent: int = DEFAULT_LINE_PERCENT
+    ):
         """
-        Initialize the font processor.
+        Initialize the font processor with configurable values.
+        If the user has not supplied custom arguments, the default values are used.
         
         Args:
             prefix: Prefix to add to font names
@@ -108,7 +124,7 @@ class FontProcessor:
         """
         Update a font's name table record using a consistent method.
         This helper function abstracts the complexity of working with name IDs,
-        platform IDs (3 for Microsoft), encoding IDs (1 for Unicode), and
+        platform IDs (3 for Windows), encoding IDs (1 for Unicode), and
         language IDs (0x0409 for English-US). This avoids repetitive code.
         
         Args:
@@ -134,7 +150,12 @@ class FontProcessor:
     # Metadata extraction
     # ============================================================
     
-    def _get_font_metadata(self, font: TTFont, font_path: str, new_family_name: Optional[str]) -> Optional[FontMetadata]:
+    def _get_font_metadata(
+        self, 
+        font: TTFont, 
+        font_path: str, 
+        new_family_name: Optional[str]
+    ) -> Optional[FontMetadata]:
         """
         Extract or infer font metadata from the font and arguments.
         This function acts as a single point of truth for font metadata,
@@ -471,7 +492,12 @@ class FontProcessor:
     # Main processing method
     # ============================================================
     
-    def process_font(self, kern: bool, remove_gpos: bool, font_path: str, new_name: Optional[str] = None) -> bool:
+    def process_font(self, 
+        kern: bool, 
+        remove_gpos: bool, 
+        font_path: str, 
+        new_name: Optional[str] = None
+    ) -> bool:
         """
         Process a single font file.
         This function orchestrates the entire process, calling the various
@@ -578,18 +604,40 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --name="Fonty" --line-percent 20 *.ttf
+  For a default experience, which will prefix the font with KF, add `kern` table and adjust line-height:
+  %(prog)s *.ttf
+
+  If you want to rename the font:
+  %(prog)s --prefix KF --name="Fonty" --line-percent 20 *.ttf
+
+  If you want to keep the line-height because for a given font the default was fine:
+  %(prog)s --line-percent 0 *.ttf
+
+  For improved legacy support, you can remove the GPOS table (not recommended):
+  %(prog)s --prefix KF --name="Fonty" --line-percent 20 --remove-gpos *.ttf
+
+  If you only want to prefix the font and rename it:
+  %(prog)s --prefix NV --name="Fonty" --line-percent 0 --skip-kobo-kern *.ttf
+
+  If you only want to prefix the font, rename it and apply line-height:
   %(prog)s --prefix NV --name="Fonty" --line-percent 20 --skip-kobo-kern *.ttf
         """
     )
     
-    parser.add_argument("fonts", nargs="+", help="Font files to process (*.ttf)")
-    parser.add_argument("--name", type=str, help="Optional new family name for all fonts")
-    parser.add_argument("--prefix", type=str, default=DEFAULT_PREFIX, help=f"Prefix to add to font names (default: {DEFAULT_PREFIX})")
-    parser.add_argument("--line-percent", type=int, default=DEFAULT_LINE_PERCENT, help=f"Line spacing adjustment percentage (default: {DEFAULT_LINE_PERCENT})")
-    parser.add_argument("--skip-kobo-kern", action="store_true", help="Skip the creation of the legacy 'kern' table from GPOS data.")
-    parser.add_argument("--remove-gpos", action="store_true", help="Remove the GPOS table after converting kerning to a 'kern' table.")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("fonts", nargs="+", 
+        help="Font files to process (*.ttf). You can use a wildcard (glob).")
+    parser.add_argument("--name", type=str, 
+        help="Optional new family name for all fonts. Other font metadata like copyright info is unaffected.")
+    parser.add_argument("--prefix", type=str, default=DEFAULT_PREFIX, 
+        help=f"Prefix to add to font names. Required. (Default: {DEFAULT_PREFIX})")
+    parser.add_argument("--line-percent", type=int, default=DEFAULT_LINE_PERCENT, 
+        help=f"Line spacing adjustment percentage. Set to 0 to make no changes to line spacing. (Default: {DEFAULT_LINE_PERCENT})")
+    parser.add_argument("--skip-kobo-kern", action="store_true", 
+        help="Skip the creation of the legacy 'kern' table from GPOS data.")
+    parser.add_argument("--remove-gpos", action="store_true", 
+        help="Remove the GPOS table after converting kerning to a 'kern' table. Does not work if `--skip-kobo-kern` is set.")
+    parser.add_argument("--verbose", action="store_true", 
+        help="Enable verbose output.")
     
     args = parser.parse_args()
     

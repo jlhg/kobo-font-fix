@@ -122,29 +122,61 @@ class FontProcessor:
     @staticmethod
     def _set_name_records(font: TTFont, name_id: int, new_name: str) -> None:
         """
-        Update a font's name table record using a consistent method.
-        This helper function abstracts the complexity of working with name IDs,
-        platform IDs (3 for Windows), encoding IDs (1 for Unicode), and
-        language IDs (0x0409 for English-US). This avoids repetitive code.
-        
-        Args:
-            font: The TTFont object.
-            name_id: The ID of the name record to update.
-            new_name: The new string for the name record.
+        Update a font's name table record for all relevant platforms,
+        encodings, and languages.
+
+        This method has been updated to iterate through all existing records
+        for the given name_id and update them, ensuring consistent naming
+        across different platforms like Windows and Macintosh.
         """
         name_table = font["name"]
         
-        # Check if the name already exists and is correct to avoid redundant updates
-        current_name = name_table.getName(name_id, 3, 1, 0x0409)
-        if current_name and current_name.toUnicode() == new_name:
-            logger.info(f"  Name ID {name_id} is already correct.")
+        # Find all existing records for the given nameID
+        names_to_update = [
+            n for n in name_table.names if n.nameID == name_id
+        ]
+        
+        # If no records exist, add new ones for standard platforms.
+        if not names_to_update:
+            logger.debug(f"  Name ID {name_id} not found; adding new records.")
+            try:
+                name_table.setName(new_name, name_id, 3, 1, 0x0409)  # Windows record
+                name_table.setName(new_name, name_id, 1, 0, 0) # Macintosh record
+                logger.debug(f"  Name ID {name_id} added as '{new_name}'.")
+            except Exception as e:
+                logger.warning(f"  Failed to add new name ID {name_id}: {e}")
             return
 
-        try:
-            name_table.setName(new_name, name_id, 3, 1, 0x0409)  # Windows, Unicode
-            logger.info(f"  Name ID {name_id} updated to '{new_name}'.")
-        except Exception as e:
-            logger.warning(f"  Failed to update name ID {name_id}: {e}")
+        updated_count = 0
+        for name_record in names_to_update:
+            try:
+                # Determine the appropriate encoding for the platform
+                if name_record.platformID == 1:  # Macintosh
+                    encoded_name = new_name.encode('mac-roman', 'ignore')
+                    if name_record.string != encoded_name:
+                        name_record.string = encoded_name
+                        updated_count += 1
+                elif name_record.platformID == 3:  # Windows
+                    encoded_name = new_name.encode('utf-16-be', 'ignore')
+                    if name_record.string != encoded_name:
+                        name_record.string = encoded_name
+                        updated_count += 1
+                else:
+                    # Fallback for other platforms to ensure consistency
+                    encoded_name = new_name.encode('utf-8', 'ignore')
+                    if name_record.string != encoded_name:
+                        name_record.string = encoded_name
+                        updated_count += 1
+                        
+            except Exception as e:
+                logger.warning(f"  Failed to update record for Name ID {name_id} "
+                              f"(Platform {name_record.platformID}, "
+                              f"Encoding {name_record.platEncID}): {e}")
+
+        if updated_count > 0:
+            logger.debug(f"  Name ID {name_id} updated for {updated_count} record(s).")
+        else:
+            logger.debug(f"  Name ID {name_id} is already correct across all records.")
             
     # ============================================================
     # Metadata extraction
@@ -179,7 +211,7 @@ class FontProcessor:
         if style_name != "Regular":
             full_name += f" {style_name}"
         
-        ps_name = f"{self.prefix}{family_name.replace(' ', '')}"
+        ps_name = f"{self.prefix}_{family_name.replace(' ', '-')}"
         if style_name != "Regular":
             ps_name += f"-{style_name.replace(' ', '')}"
         
@@ -346,21 +378,24 @@ class FontProcessor:
         if "name" not in font:
             logger.warning("  No 'name' table found; skipping all name changes")
             return
+        else:
+            logger.info("  Renaming the font to: " + f"{self.prefix} {metadata.full_name}")
         
-        # Update Name ID 1 (Family Name) and 16 (Typographic Family)
+        # Update Family Name
         self._set_name_records(font, 1, f"{self.prefix} {metadata.family_name}")
-        self._set_name_records(font, 16, f"{self.prefix} {metadata.family_name}")
-
-        # Update Name ID 2 (Subfamily Name) and 17 (Preferred Subfamily)
-        # These are crucial for font menu display on macOS and Windows,
-        # ensuring the font correctly groups with its family.
+        # Update Subfamily
         self._set_name_records(font, 2, metadata.style_name)
-        self._set_name_records(font, 17, metadata.style_name)
-        
-        # Update Full Name (Name ID 4)
+        # Update Full Name
         self._set_name_records(font, 4, f"{self.prefix} {metadata.full_name}")
 
-        # Update Unique ID (nameID 3)
+        # Update Typographic Family
+        self._set_name_records(font, 16, f"{self.prefix} {metadata.family_name}")
+        # Update Preferred Subfamily
+        self._set_name_records(font, 17, metadata.style_name)
+        # Update Preferred Family
+        self._set_name_records(font, 18, f"{self.prefix} {metadata.family_name}")
+
+        # Update Unique ID (ID 3)
         try:
             current_unique = font["name"].getName(3, 3, 1).toUnicode()
             parts = current_unique.split("Version")
@@ -371,13 +406,44 @@ class FontProcessor:
         except Exception as e:
             logger.warning(f"  Failed to update Unique ID: {e}")
                     
-        # Update PostScript Name (nameID 6)
+        # Update PostScript Name (ID 6)
         new_ps_name = metadata.ps_name
         self._set_name_records(font, 6, new_ps_name)
 
-        if "CFF " in font and font["CFF "].cff.topDictIndex[0].fontName != new_ps_name:
-            font["CFF "].cff.topDictIndex[0].fontName = new_ps_name
-            logger.info(f"  PostScript CFF fontName updated to '{new_ps_name}'.")
+        # Update PostScript data in CFF (if applicable)
+        if "CFF " in font:
+            cff = font["CFF "].cff
+            cff_topdict = cff.topDictIndex[0]
+            
+            name_mapping = {
+                "FullName": f"{self.prefix} {metadata.full_name}",
+                "FamilyName": f"{self.prefix} {metadata.family_name.replace(' ', '_')}"
+            }
+
+            for key, new_value in name_mapping.items():
+                if key in cff_topdict.rawDict:
+                    current_value = cff_topdict.rawDict[key]
+                    if current_value != new_value:
+                        cff_topdict.rawDict[key] = new_value
+                        logger.debug(f"  CFF table '{key}' updated to '{new_value}'.")
+                    else:
+                        logger.debug(f"  CFF table '{key}' is already correct.")
+
+            logger.warning("  CFF table found. The original font name may persist as part of an indexed `Name INDEX`. (This cannot be easily fixed with this script. If you are encountering issues, I recommend using FontForge.)")
+        else:
+            logger.debug("  No 'CFF' table in this font.")
+
+        # Update PostScript data if relevant
+        if "post" in font:
+            if hasattr(font["post"], "fontName"):
+                new_ps_name = metadata.ps_name
+                if font["post"].fontName != new_ps_name:
+                    font["post"].fontName = new_ps_name
+                    logger.debug(f"  'post' table updated with new fontName '{new_ps_name}'.")
+                else:
+                    logger.debug("  'post' table fontName is already correct.")
+        else:
+            logger.debug("  No 'post' table in this font.")
 
     # ============================================================
     # Weight metadata methods
@@ -395,18 +461,18 @@ class FontProcessor:
         if "OS/2" in font and hasattr(font["OS/2"], "usWeightClass"):
             if font["OS/2"].usWeightClass != os2_weight:
                 font["OS/2"].usWeightClass = os2_weight
-                logger.info(f"  OS/2 usWeightClass updated to {os2_weight}.")
+                logger.debug(f"  OS/2 usWeightClass updated to {os2_weight}.")
             else:
-                logger.info("  OS/2 usWeightClass is already correct.")
+                logger.debug("  OS/2 usWeightClass is already correct.")
         
         if "CFF " in font and hasattr(font["CFF "].cff.topDictIndex[0], "Weight"):
             if getattr(font["CFF "].cff.topDictIndex[0], "Weight", "") != ps_weight:
                 font["CFF "].cff.topDictIndex[0].Weight = ps_weight
-                logger.info(f"  PostScript CFF weight updated to '{ps_weight}'.")
+                logger.debug(f"  PostScript CFF weight updated to '{ps_weight}'.")
         elif "post" in font and hasattr(font["post"], "Weight"):
             if getattr(font["post"], "Weight", "") != ps_weight:
                 font["post"].Weight = ps_weight
-                logger.info(f"  PostScript 'post' weight updated to '{ps_weight}'.")
+                logger.debug(f"  PostScript 'post' weight updated to '{ps_weight}'.")
 
     # ============================================================
     # PANOSE methods
@@ -450,7 +516,7 @@ class FontProcessor:
         if changes:
             logger.info(f"  PANOSE corrected: {', '.join(changes)}")
         else:
-            logger.info("  PANOSE check passed.")
+            logger.info("  PANOSE check passed, no modifications required.")
     
     # ============================================================
     # Line adjustment methods

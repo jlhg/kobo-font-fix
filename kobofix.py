@@ -88,10 +88,10 @@ class FontProcessor:
         # Determine style name from filename suffix
         base_filename = os.path.basename(font_path)
         style_map = {
-            "-BoldItalic": "Bold Italic",
-            "-Bold": "Bold",
-            "-Italic": "Italic",
-            "-Regular": "Regular",
+            "BoldItalic": "Bold Italic",
+            "Bold": "Bold",
+            "Italic": "Italic",
+            "Regular": "Regular",
         }
         
         style_name = "Regular" # Default to regular if no suffix found
@@ -609,7 +609,7 @@ class FontProcessor:
     # Main processing method
     # ============================================================
     
-    def process_font(self, kern: bool, font_path: str, new_name: Optional[str] = None) -> bool:
+    def process_font(self, kern: bool, remove_gpos: bool, font_path: str, new_name: Optional[str] = None) -> bool:
         """
         Process a single font file.
         
@@ -658,6 +658,11 @@ class FontProcessor:
                 # Skip kerning step
                 logger.info("  Skipping `kern` step")
             
+            # Remove GPOS if requested and kerning was processed
+            if remove_gpos and kern and "GPOS" in font:
+                del font["GPOS"]
+                logger.info("  Removed GPOS table from the font.")
+
             # Generate output filename
             output_path = self._generate_output_path(font_path, metadata)
             
@@ -771,6 +776,11 @@ Examples:
         help="Skip the creation of the legacy 'kern' table from GPOS data."
     )
     parser.add_argument(
+        "--remove-gpos", 
+        action="store_true",
+        help="Remove the GPOS table after converting kerning to a 'kern' table."
+    )
+    parser.add_argument(
         "--verbose", 
         action="store_true",
         help="Enable verbose output"
@@ -812,6 +822,7 @@ Examples:
     for font_path in valid_files:
         if processor.process_font(
             not args.skip_kobo_kern,
+            args.remove_gpos,
             font_path, 
             args.name, 
         ):

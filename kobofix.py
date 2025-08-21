@@ -5,7 +5,6 @@ from collections import defaultdict
 from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables._k_e_r_n import KernTable_format_0
 
-
 # ------------------------------------------------------------
 # Kerning extraction
 # ------------------------------------------------------------
@@ -141,8 +140,8 @@ def add_legacy_kern(font, kern_pairs):
 # Name table updates
 # ------------------------------------------------------------
 
-def rename_font(font):
-    """Prefix the font's family/full names with 'KC '.
+def rename_font(font, prefix):
+    """Prefix the font's family/full names with a given prefix.
     Updates name IDs 1 (Family), 4 (Full), and 16 (Typographic Family) when present.
     """
     if "name" not in font:
@@ -152,14 +151,37 @@ def rename_font(font):
     for record in name_table.names:
         if record.nameID in ids_to_prefix:
             try:
-                new_name = "KC " + record.toUnicode()
+                new_name = prefix + " " + record.toUnicode()
                 record.string = new_name.encode(record.getEncoding())
             except Exception:
                 # Fallback encoding if getEncoding fails
                 try:
-                    record.string = ("KC " + record.toUnicode()).encode("utf_16_be")
+                    record.string = (prefix + " " + record.toUnicode()).encode("utf_16_be")
                 except Exception:
                     pass
+
+def update_unique_id(font, prefix):
+    """
+    Automatically prefix the font's Unique ID (nameID 3) with a given prefix.
+    Keeps the version info if present, or sets a default if missing.
+    Updates all records for all platforms/encodings.
+    """
+    for record in font["name"].names:
+        if record.nameID == 3:
+            current_unique = record.toUnicode()
+            
+            # Split at 'Version' to preserve version info if it exists
+            parts = current_unique.split("Version")
+            if len(parts) == 2:
+                version_info = "Version" + parts[1]
+            else:
+                version_info = "Version 1.000"  # fallback
+            
+            # Build new Unique ID with prefix
+            new_unique_id = prefix + " " + parts[0].strip() + ":" + version_info
+            
+            # Update the record safely with proper encoding
+            record.string = new_unique_id.encode(record.getEncoding())
 
 
 # ------------------------------------------------------------
@@ -231,10 +253,10 @@ def process_font(path):
     """Load, process, and save the font.
 
     Steps (each independent):
-      1) Prefix names with "KC ".
+      1) Prefix names with prefix.
       2) Check & fix PANOSE based on filename.
       3) Extract kerning from GPOS and write a legacy 'kern' table.
-      4) Save as KC_<original>.<ext>
+      4) Save as PREFIX_<original>.<ext>
     """
     print(f"Processing: {path}")
     try:
@@ -243,8 +265,12 @@ def process_font(path):
         print(f"  ERROR: Failed to open font: {e}")
         return
 
+    # Set up a prefix
+    prefix = "KF"
+
     # Always run name prefix & PANOSE checks, regardless of kerning outcome
-    rename_font(font)
+    rename_font(font, prefix)
+    update_unique_id(font, prefix)
     check_and_fix_panose(font, os.path.basename(path))
 
     # Extract kerning (robust against missing/odd structures)
@@ -261,15 +287,28 @@ def process_font(path):
 
     # Save
     dirname, filename = os.path.split(path)
-    out_path = os.path.join(dirname, f"KC_{filename}")
+    out_path = os.path.join(dirname, f"{prefix}_{filename}")
     try:
         font.save(out_path)
         print(f"  Saved: {out_path}")
 
         # Run font-line adjustment in-place
         try:
-            subprocess.run(["font-line", "percent", "20", "--inplace", out_path], check=True)
-            print("  font-line applied in-place (20% baseline shift).")
+            subprocess.run(["font-line", "percent", "20", out_path], check=True, stdout=subprocess.DEVNULL)
+            # Determine the expected linegap filename
+            base, ext = os.path.splitext(out_path)
+            linegap_file = f"{base}-linegap20{ext}"
+
+            # Remove the original font
+            if os.path.exists(out_path):
+                os.remove(out_path)
+
+            # Rename the linegap file back to the original output path
+            if os.path.exists(linegap_file):
+                os.rename(linegap_file, out_path)
+                print("  font-line applied successfully (20% baseline shift).")
+            else:
+                print(f"  WARNING: expected font-line output '{linegap_file}' not found.")
         except FileNotFoundError:
             print("  ERROR: font-line utility not found. Please install it first (see README). Aborting.")
             sys.exit(1)
@@ -277,9 +316,6 @@ def process_font(path):
             print(f"  WARNING: font-line failed: {e}")
     except Exception as e:
         print(f"  ERROR: Failed to save font: {e}")
-
-    print("")
-
 
 # ------------------------------------------------------------
 # CLI

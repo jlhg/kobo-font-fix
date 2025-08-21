@@ -6,18 +6,25 @@
 
 It generates a renamed font, fixes PANOSE information based on the filename, adjusts the baseline with the `font-line` utility, and adds a legacy `kern` table which allows the `kepub` engine for improved rendering of kerned pairs.
 
+You can use this to modify or fix your own, legally acquired fonts (assuming you are permitted to do so).
+
 ## Requirements
 
-* **Python 3.8+**
-* **FontTools**
+Python 3, FontTools, `font-line`.
+
+You can install them like so:
+
 
 ```bash
 pip3 install fonttools
+pip3 install font-line
 ```
-* **font-line** utility
+
+On macOS, if you're using the built-in version of Python (via Xcode), you may need to first add a folder to your `PATH` to make `font-line` available, like:
 
 ```bash
-pip3 install font-line
+echo 'export PATH="$HOME/Library/Python/3.9/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
 ```
 
 ## Usage
@@ -31,13 +38,13 @@ pip3 install font-line
 3. The script will:
 
    * Validate filenames.
-   * Process each font.
+   * Process each font (e.g. "Lora" becomes "KF Lora").
    * Apply kerning, rename, PANOSE adjustments, and baseline shift.
-   * Save output as `KC_<original_filename>`.
+   * Save output as `KF_<original_filename>`.
 
 Example:
 
 ```
 Original: Lora-BoldItalic.ttf
-Processed: KC_Lora-BoldItalic.ttf
+Processed: KF_Lora-BoldItalic.ttf
 ```

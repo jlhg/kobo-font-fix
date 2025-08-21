@@ -563,7 +563,7 @@ class FontProcessor:
         remove_gpos: bool, 
         font_path: str, 
         new_name: Optional[str] = None,
-        remove_prefix: Optional[str] = None
+        remove_prefix: Optional[str] = None,
     ) -> bool:
         """
         Process a single font file.
@@ -577,6 +577,15 @@ class FontProcessor:
         except Exception as e:
             logger.error(f"  Failed to open font: {e}")
             return False
+
+        # Remove WWS family names (IDs 21 and 22) to prevent confusion when determining best family name
+        if font["name"]:
+            old_names_list = font["name"].names
+            names_to_remove = [21, 22]
+            new_names_list = [n for n in old_names_list if n.nameID not in names_to_remove]
+            if len(new_names_list) < len(old_names_list):
+                font["name"].names = new_names_list
+                logger.info("  Removed WWS Family Name (ID 21) and WWS Subfamily Name (ID 22).")
         
         # Determine the effective font name, checking for `--remove-prefix` first
         effective_name = new_name

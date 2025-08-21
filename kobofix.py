@@ -562,7 +562,8 @@ class FontProcessor:
         kern: bool, 
         remove_gpos: bool, 
         font_path: str, 
-        new_name: Optional[str] = None
+        new_name: Optional[str] = None,
+        remove_prefix: Optional[str] = None
     ) -> bool:
         """
         Process a single font file.
@@ -577,7 +578,17 @@ class FontProcessor:
             logger.error(f"  Failed to open font: {e}")
             return False
         
-        metadata = self._get_font_metadata(font, font_path, new_name)
+        # Determine the effective font name, checking for `--remove-prefix` first
+        effective_name = new_name
+        if new_name is None:
+            # If no --name argument is provided, get the font's best family name
+            current_family_name = font["name"].getBestFamilyName()
+            # If --remove-prefix is used and the name starts with the specified prefix, remove it
+            if remove_prefix and current_family_name.startswith(remove_prefix + " "):
+                effective_name = current_family_name[len(remove_prefix + " "):]
+                logger.info(f"  --remove-prefix enabled: using '{effective_name}' as the new family name.")
+        
+        metadata = self._get_font_metadata(font, font_path, effective_name)
         if not metadata:
             return False
         
@@ -682,11 +693,8 @@ Examples:
   For improved legacy support, you can remove the GPOS table (not recommended):
   %(prog)s --prefix KF --name="Fonty" --line-percent 20 --remove-gpos *.ttf
 
-  If you only want to prefix the font and rename it:
-  %(prog)s --prefix NV --name="Fonty" --line-percent 0 --skip-kobo-kern *.ttf
-
-  If you only want to prefix the font, rename it and apply line-height:
-  %(prog)s --prefix NV --name="Fonty" --line-percent 20 --skip-kobo-kern *.ttf
+  To remove a specific prefix, like "NV", before applying a new one:
+  %(prog)s --prefix KF --remove-prefix="NV" *.ttf
         """
     )
     
@@ -704,6 +712,9 @@ Examples:
         help="Remove the GPOS table after converting kerning to a 'kern' table. Does not work if `--skip-kobo-kern` is set.")
     parser.add_argument("--verbose", action="store_true", 
         help="Enable verbose output.")
+    parser.add_argument("--remove-prefix", type=str,
+        help="Remove a leading prefix from font names before applying the new prefix. Only works if `--name` is not used. (e.g., --remove-prefix=\"NV\")")
+
     
     args = parser.parse_args()
     
@@ -740,7 +751,8 @@ Examples:
             not args.skip_kobo_kern,
             args.remove_gpos,
             font_path, 
-            args.name, 
+            args.name,
+            args.remove_prefix,
         ):
             success_count += 1
     

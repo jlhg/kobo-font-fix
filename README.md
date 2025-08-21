@@ -52,9 +52,17 @@ This applies the KF prefix, applies 20 percent line spacing and adds a Kobo `ker
 
 The `--name` parameter is used to change the name of the font family.
 
-   ```bash
-   ./kobofix.py --prefix KF --name="Fonty" --line-percent 20 *.ttf
-   ```
+```bash
+./kobofix.py --prefix KF --name="Fonty" --line-percent 20 *.ttf
+```
+
+To process fonts from my [ebook-fonts](https://github.com/nicoverbruggen/ebook-fonts) collection which are prefixed with "NV", you can replace the prefix and make adjustments in bulk. 
+
+To process all fonts with the "Kobo Fix" preset, simply run:
+
+```bash
+./kobofix.py --prefix KF --remove-prefix="NV" --line-percent 20 *.ttf
+```
 
 ### Generating NV fonts
 

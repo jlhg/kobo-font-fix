@@ -471,10 +471,12 @@ class FontProcessor:
             # Save modified font
             font.save(output_path)
             logger.info(f"  Saved: {output_path}")
-            
-            # Apply line adjustments
-            self.apply_line_adjustment(output_path)
-            
+
+            if self.line_percent != 0:
+                # Apply line adjustments
+                self.apply_line_adjustment(output_path)
+            else:
+                logger.info("  Skipping line adjustment step")
             return True
             
         except Exception as e:

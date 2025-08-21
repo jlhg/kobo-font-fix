@@ -5,6 +5,7 @@ Font processing utility for Kobo e-readers.
 This script processes TrueType fonts to improve compatibility with
 Kobo e-readers by:
 - Adding a custom prefix to font names
+- Updating the font name if necessary, including PS name
 - Extracting GPOS kerning data and creating legacy 'kern' tables
 - Validating and correcting PANOSE metadata
 - Adjusting font metrics for better line spacing
@@ -22,6 +23,7 @@ import argparse
 import logging
 from pathlib import Path
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Dict, Tuple, Optional, List
 
 from fontTools.ttLib import TTFont, newTable
@@ -40,6 +42,15 @@ logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class FontMetadata:
+    """A container for consistent font naming and metadata."""
+    family_name: str
+    style_name: str
+    full_name: str
+    ps_name: str
+
+
 class FontProcessor:
     """Main font processing class."""
     
@@ -56,6 +67,59 @@ class FontProcessor:
         self.line_percent = line_percent
         self.kobo_kern_fix = kobo_kern_fix
     
+    # ============================================================
+    # Metadata extraction
+    # ============================================================
+    
+    def _get_font_metadata(self, font: TTFont, font_path: str, new_family_name: Optional[str]) -> Optional[FontMetadata]:
+        """Extract or infer font metadata from the font and arguments, prioritizing filename suffix."""
+        if "name" not in font:
+            logger.warning("  No 'name' table found; cannot determine metadata.")
+            return None
+        
+        name_table = font["name"]
+        
+        # Determine family name
+        family_name = new_family_name if new_family_name else name_table.getBestFamilyName()
+        if not family_name:
+            logger.warning("  Could not determine font family name.")
+            return None
+        
+        # Determine style name from filename suffix
+        base_filename = os.path.basename(font_path)
+        style_map = {
+            "-BoldItalic": "Bold Italic",
+            "-Bold": "Bold",
+            "-Italic": "Italic",
+            "-Regular": "Regular",
+        }
+        
+        style_name = "Regular" # Default to regular if no suffix found
+        
+        # Iterate through styles and check if filename contains the style string
+        for style_key, style_val in style_map.items():
+            if style_key.lower() in base_filename.lower():
+                style_name = style_val
+                break
+        
+        # Construct the full name and PS name based on style name logic
+        full_name = f"{family_name}"
+        if style_name != "Regular":
+            full_name += f" {style_name}"
+        
+        ps_name = f"{self.prefix}{family_name.replace(' ', '')}"
+        if style_name != "Regular":
+            ps_name += f"-{style_name.replace(' ', '')}"
+        
+        logger.debug(f"  Constructed metadata: family='{family_name}', style='{style_name}', full='{full_name}', ps='{ps_name}'")
+        
+        return FontMetadata(
+            family_name=family_name,
+            style_name=style_name,
+            full_name=full_name,
+            ps_name=ps_name
+        )
+        
     # ============================================================
     # Kerning extraction methods
     # ============================================================
@@ -172,31 +236,25 @@ class FontProcessor:
         """
         pairs = defaultdict(int)
         
-        if "GPOS" not in font:
-            return {}
-        
-        gpos = font["GPOS"].table
-        lookup_list = getattr(gpos, "LookupList", None)
-        
-        if not lookup_list or not lookup_list.Lookup:
-            return {}
-        
-        for lookup in lookup_list.Lookup:
-            # Only process Pair Adjustment lookups (type 2)
-            if getattr(lookup, "LookupType", None) != 2:
-                continue
+        if "GPOS" in font:
+            gpos = font["GPOS"].table
+            lookup_list = getattr(gpos, "LookupList", None)
             
-            for subtable in getattr(lookup, "SubTable", []):
-                fmt = getattr(subtable, "Format", None)
-                
-                if fmt == 1:
-                    format1_pairs = self._extract_format1_pairs(subtable)
-                    for key, value in format1_pairs.items():
-                        pairs[key] += value
-                elif fmt == 2:
-                    format2_pairs = self._extract_format2_pairs(subtable)
-                    for key, value in format2_pairs.items():
-                        pairs[key] += value
+            if lookup_list and lookup_list.Lookup:
+                for lookup in lookup_list.Lookup:
+                    # Only process Pair Adjustment lookups (type 2)
+                    if getattr(lookup, "LookupType", None) == 2:
+                        for subtable in getattr(lookup, "SubTable", []):
+                            fmt = getattr(subtable, "Format", None)
+                            
+                            if fmt == 1:
+                                format1_pairs = self._extract_format1_pairs(subtable)
+                                for key, value in format1_pairs.items():
+                                    pairs[key] += value
+                            elif fmt == 2:
+                                format2_pairs = self._extract_format2_pairs(subtable)
+                                for key, value in format2_pairs.items():
+                                    pairs[key] += value
         
         return dict(pairs)
     
@@ -244,126 +302,121 @@ class FontProcessor:
     # Name table methods
     # ============================================================
     
-    def rename_font(self, font: TTFont, new_name: Optional[str] = None) -> None:
+    def rename_font(self, font: TTFont, metadata: FontMetadata) -> None:
         """
-        Prefix the font's family and full names.
+        Update the font's name-related metadata.
+        
+        This method prefixes family, full, and unique names, and updates
+        the PostScript font name.
         
         Args:
             font: Font object to modify
-            new_name: Optional override for the font name
+            metadata: The FontMetadata object containing the new names
         """
         if "name" not in font:
+            logger.warning("  No 'name' table found; skipping all name changes")
             return
         
         name_table = font["name"]
-        # Name IDs: 1=Family, 4=Full Name, 16=Typographic Family
-        ids_to_update = {1, 4, 16}
         
+        # Update Name ID 1 (Family Name) and 16 (Typographic Family)
+        family_name_str = f"{self.prefix} {metadata.family_name}"
         for record in name_table.names:
-            if record.nameID in ids_to_update:
+            if record.nameID in {1, 16}:
                 try:
-                    base_name = new_name if new_name else record.toUnicode()
-                    new_record_name = f"{self.prefix} {base_name}"
-                    record.string = new_record_name.encode(record.getEncoding())
+                    current_name = record.toUnicode()
+                    if current_name != family_name_str:
+                        record.string = family_name_str.encode(record.getEncoding())
+                        logger.info(f"  Name ID {record.nameID} updated: '{current_name}'->'{family_name_str}'")
+                    else:
+                        logger.info(f"  Name ID {record.nameID} is already correct")
                 except Exception:
-                    # Fallback to UTF-16 BE encoding
                     try:
-                        record.string = new_record_name.encode("utf_16_be")
-                    except Exception:
-                        logger.warning(f"Failed to update name ID {record.nameID}")
-    
-    def update_unique_id(self, font: TTFont, new_name: Optional[str] = None) -> None:
-        """
-        Update the font's Unique ID (nameID 3) with prefix.
-        
-        Args:
-            font: Font object to modify
-            new_name: Optional override for the font name
-        """
-        if "name" not in font:
-            return
-        
-        for record in font["name"].names:
+                        record.string = family_name_str.encode("utf_16_be")
+                        logger.info(f"  Name ID {record.nameID} updated with UTF-16 BE encoding")
+                    except Exception as e:
+                        logger.warning(f"  Failed to update name ID {record.nameID}: {e}")
+
+        # Update Name ID 4 (Full Name)
+        full_name_str = f"{self.prefix} {metadata.full_name}"
+        for record in name_table.names:
+            if record.nameID == 4:
+                try:
+                    current_name = record.toUnicode()
+                    if current_name != full_name_str:
+                        record.string = full_name_str.encode(record.getEncoding())
+                        logger.info(f"  Name ID 4 updated: '{current_name}'->'{full_name_str}'")
+                    else:
+                        logger.info("  Name ID 4 is already correct")
+                except Exception:
+                    try:
+                        record.string = full_name_str.encode("utf_16_be")
+                        logger.info("  Name ID 4 updated with UTF-16 BE encoding")
+                    except Exception as e:
+                        logger.warning(f"  Failed to update name ID 4: {e}")
+
+        # --- Update Unique ID (nameID 3) ---
+        for record in name_table.names:
             if record.nameID == 3:  # Unique ID
                 try:
                     current_unique = record.toUnicode()
-                    # Preserve version info if present
                     parts = current_unique.split("Version")
                     version_info = f"Version{parts[1]}" if len(parts) == 2 else "Version 1.000"
-                    base_name = new_name if new_name else parts[0].strip()
-                    new_unique_id = f"{self.prefix} {base_name}:{version_info}"
-                    record.string = new_unique_id.encode(record.getEncoding())
-                except Exception:
-                    try:
-                        record.string = new_unique_id.encode("utf_16_be")
-                    except Exception:
-                        logger.warning("Failed to update Unique ID")
-    
-    # ============================================================
-    # PANOSE methods
-    # ============================================================
-    
-    @staticmethod
-    def check_and_fix_panose(font: TTFont, filename: str) -> None:
-        """
-        Check and adjust PANOSE values based on filename suffix.
+                    
+                    new_unique_id = f"{self.prefix} {metadata.family_name.strip()}:{version_info}"
+                    if current_unique != new_unique_id:
+                        record.string = new_unique_id.encode(record.getEncoding())
+                        logger.info(f"  Unique ID updated: '{current_unique}'->'{new_unique_id}'")
+                    else:
+                        logger.info("  Unique ID is already correct")
+                except Exception as e:
+                    logger.warning(f"  Failed to update Unique ID: {e}")
+                    
+        # --- Update PostScript Name (nameID 6) and other tables ---
+        new_ps_name = metadata.ps_name
         
-        Args:
-            font: Font object to modify
-            filename: Font filename to check suffix
-        """
-        # PANOSE expected values for each style
-        style_specs = {
-            "-BoldItalic": {"weight": 8, "letterform": 3},
-            "-Bold": {"weight": 8, "letterform": 2},
-            "-Italic": {"weight": 5, "letterform": 3},
-            "-Regular": {"weight": 5, "letterform": 2},
-        }
+        name_updated = False
         
-        if "OS/2" not in font:
-            logger.warning("  No OS/2 table found; skipping PANOSE check")
+        # 1. Try to update the name table (nameID 6)
+        for record in name_table.names:
+            if record.nameID == 6:  # PostScript Name
+                try:
+                    current_name = record.toUnicode()
+                    if current_name != new_ps_name:
+                        record.string = new_ps_name.encode(record.getEncoding())
+                        logger.info(f"  PostScript name table (nameID 6) updated: '{current_name}'->'{new_ps_name}'")
+                    else:
+                        logger.info("  PostScript name table (nameID 6) is already correct")
+                    name_updated = True
+                    break
+                except Exception as e:
+                    logger.warning(f"  Failed to update PostScript name in name table: {e}")
+        
+        if name_updated:
             return
-        
-        if not hasattr(font["OS/2"], "panose") or font["OS/2"].panose is None:
-            logger.warning("  No PANOSE information; skipping PANOSE check")
-            return
-        
-        panose = font["OS/2"].panose
-        base_filename = os.path.basename(filename)
-        
-        # Find matching style
-        matched_style = None
-        for style, specs in style_specs.items():
-            if style in base_filename:
-                matched_style = style
-                expected = specs
-                break
-        
-        if not matched_style:
-            logger.warning(
-                f"  Filename doesn't match expected patterns {list(style_specs.keys())}. "
-                "PANOSE check skipped"
-            )
-            return
-        
-        # Check and fix values
-        changes = []
-        current_weight = getattr(panose, "bWeight", None)
-        current_letterform = getattr(panose, "bLetterForm", None)
-        
-        if current_weight != expected["weight"]:
-            panose.bWeight = expected["weight"]
-            changes.append(f"bWeight {current_weight}->{expected['weight']}")
-        
-        if current_letterform != expected["letterform"]:
-            panose.bLetterForm = expected["letterform"]
-            changes.append(f"bLetterForm {current_letterform}->{expected['letterform']}")
-        
-        if changes:
-            logger.info(f"  PANOSE corrected for {matched_style}: {', '.join(changes)}")
+            
+        # 2. Fallback to CFF or post table if nameID 6 wasn't found or updated
+        if "CFF " in font:
+            top_dict = font["CFF "].cff.topDictIndex[0]
+            current_name = getattr(top_dict, "fontName", "")
+            
+            if current_name != new_ps_name:
+                top_dict.fontName = new_ps_name
+                logger.info(f"  PostScript CFF fontName updated: '{current_name}'->'{new_ps_name}'")
+            else:
+                logger.info("  PostScript CFF fontName is already correct")
+        elif "post" in font:
+            post_table = font["post"]
+            current_name = getattr(post_table, "postscriptName", "")
+            
+            if current_name != new_ps_name:
+                post_table.postscriptName = new_ps_name
+                logger.info(f"  PostScript 'post' fontName updated: '{current_name}'->'{new_ps_name}'")
+            else:
+                logger.info("  PostScript 'post' fontName is already correct")
         else:
-            logger.info(f"  PANOSE check passed for {matched_style}")
-    
+            logger.warning("  No PostScript name found in `name`, `CFF` or `post` tables.")
+
     # ============================================================
     # Weight metadata methods
     # ============================================================
@@ -432,6 +485,71 @@ class FontProcessor:
                 logger.info("  PostScript 'post' weight is already correct")
         else:
             logger.warning("  No CFF or post table weight found; skipping")
+            
+    # ============================================================
+    # PANOSE methods
+    # ============================================================
+    
+    @staticmethod
+    def check_and_fix_panose(font: TTFont, filename: str) -> None:
+        """
+        Check and adjust PANOSE values based on filename suffix.
+        
+        Args:
+            font: Font object to modify
+            filename: Font filename to check suffix
+        """
+        # PANOSE expected values for each style
+        style_specs = {
+            "-BoldItalic": {"weight": 8, "letterform": 3},
+            "-Bold": {"weight": 8, "letterform": 2},
+            "-Italic": {"weight": 5, "letterform": 3},
+            "-Regular": {"weight": 5, "letterform": 2},
+        }
+        
+        if "OS/2" not in font:
+            logger.warning("  No OS/2 table found; skipping PANOSE check")
+            return
+        
+        if not hasattr(font["OS/2"], "panose") or font["OS/2"].panose is None:
+            logger.warning("  No PANOSE information; skipping PANOSE check")
+            return
+        
+        panose = font["OS/2"].panose
+        base_filename = os.path.basename(filename)
+        
+        # Find matching style
+        matched_style = None
+        for style, specs in style_specs.items():
+            if style in base_filename:
+                matched_style = style
+                expected = specs
+                break
+        
+        if not matched_style:
+            logger.warning(
+                f"  Filename doesn't match expected patterns {list(style_specs.keys())}. "
+                "PANOSE check skipped"
+            )
+            return
+        
+        # Check and fix values
+        changes = []
+        current_weight = getattr(panose, "bWeight", None)
+        current_letterform = getattr(panose, "bLetterForm", None)
+        
+        if current_weight != expected["weight"]:
+            panose.bWeight = expected["weight"]
+            changes.append(f"bWeight {current_weight}->{expected['weight']}")
+        
+        if current_letterform != expected["letterform"]:
+            panose.bLetterForm = expected["letterform"]
+            changes.append(f"bLetterForm {current_letterform}->{expected['letterform']}")
+        
+        if changes:
+            logger.info(f"  PANOSE corrected for {matched_style}: {', '.join(changes)}")
+        else:
+            logger.info(f"  PANOSE check passed for {matched_style}")
     
     # ============================================================
     # Line adjustment methods
@@ -511,11 +629,15 @@ class FontProcessor:
             logger.error(f"  Failed to open font: {e}")
             return False
         
+        # Generate metadata
+        metadata = self._get_font_metadata(font, font_path, new_name)
+        if not metadata:
+            return False
+        
         # Process font
         try:
             # Update names
-            self.rename_font(font, new_name)
-            self.update_unique_id(font, new_name)
+            self.rename_font(font, metadata)
             
             # Fix PANOSE and weight metadata
             self.check_and_fix_panose(font, font_path)
@@ -537,7 +659,7 @@ class FontProcessor:
                 logger.info("  Skipping `kern` step")
             
             # Generate output filename
-            output_path = self._generate_output_path(font_path, new_name)
+            output_path = self._generate_output_path(font_path, metadata)
             
             # Save modified font
             font.save(output_path)
@@ -554,7 +676,7 @@ class FontProcessor:
             logger.error(f"  Processing failed: {e}")
             return False
     
-    def _generate_output_path(self, original_path: str, new_name: Optional[str]) -> str:
+    def _generate_output_path(self, original_path: str, metadata: FontMetadata) -> str:
         """Generate the output path for the processed font."""
         dirname = os.path.dirname(original_path)
         original_name, ext = os.path.splitext(os.path.basename(original_path))
@@ -567,10 +689,7 @@ class FontProcessor:
                 break
         
         # Build new filename
-        if new_name:
-            base_name = f"{self.prefix}_{new_name.replace(' ', '_')}{suffix}"
-        else:
-            base_name = f"{self.prefix}_{original_name}"
+        base_name = f"{self.prefix}_{metadata.family_name.replace(' ', '_')}{suffix}"
         
         return os.path.join(dirname, f"{base_name}{ext.lower()}")
 

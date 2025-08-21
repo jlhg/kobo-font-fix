@@ -8,6 +8,7 @@ Kobo e-readers by:
 - Extracting GPOS kerning data and creating legacy 'kern' tables
 - Validating and correcting PANOSE metadata
 - Adjusting font metrics for better line spacing
+- Updating font weight metadata (OS/2 usWeightClass and PostScript weight string)
 
 Requirements:
 - fontTools (pip install fonttools)
@@ -364,6 +365,75 @@ class FontProcessor:
             logger.info(f"  PANOSE check passed for {matched_style}")
     
     # ============================================================
+    # Weight metadata methods
+    # ============================================================
+
+    def update_weight_metadata(self, font: TTFont, filename: str) -> None:
+        """
+        Update font weight metadata based on filename suffix.
+
+        Args:
+            font: Font object to modify
+            filename: Font filename to check suffix
+        """
+        weight_map = {
+            "-Regular": ("Regular", 400),
+            "-Italic": ("Italic", 400),
+            "-Bold": ("Bold", 700),
+            "-BoldItalic": ("Bold Italic", 700),
+        }
+        
+        base_filename = os.path.basename(filename)
+        
+        # Find matching style and corresponding weight data
+        matched_style = None
+        for suffix, (ps_weight, os2_weight) in weight_map.items():
+            if suffix in base_filename:
+                matched_style = suffix
+                self._update_os2_weight(font, os2_weight)
+                self._update_postscript_weight(font, ps_weight)
+                break
+        
+        if not matched_style:
+            logger.warning(
+                f"  Filename doesn't match expected patterns {list(weight_map.keys())}. "
+                "Weight metadata skipped"
+            )
+
+    @staticmethod
+    def _update_os2_weight(font: TTFont, weight: int) -> None:
+        """Update the OS/2 usWeightClass."""
+        if "OS/2" in font and hasattr(font["OS/2"], "usWeightClass"):
+            current_weight = font["OS/2"].usWeightClass
+            if current_weight != weight:
+                font["OS/2"].usWeightClass = weight
+                logger.info(f"  OS/2 usWeightClass updated: {current_weight}->{weight}")
+            else:
+                logger.info("  OS/2 usWeightClass is already correct")
+        else:
+            logger.warning("  No OS/2 usWeightClass table found; skipping")
+
+    @staticmethod
+    def _update_postscript_weight(font: TTFont, weight: str) -> None:
+        """Update the PostScript weight string."""
+        if "CFF " in font and hasattr(font["CFF "].cff.topDictIndex[0], "Weight"):
+            current_weight = getattr(font["CFF "].cff.topDictIndex[0], "Weight", "")
+            if current_weight != weight:
+                font["CFF "].cff.topDictIndex[0].Weight = weight
+                logger.info(f"  PostScript CFF weight updated: '{current_weight}'->'{weight}'")
+            else:
+                logger.info("  PostScript CFF weight is already correct")
+        elif "post" in font and hasattr(font["post"], "Weight"):
+            current_weight = getattr(font["post"], "Weight", "")
+            if current_weight != weight:
+                font["post"].Weight = weight
+                logger.info(f"  PostScript 'post' weight updated: '{current_weight}'->'{weight}'")
+            else:
+                logger.info("  PostScript 'post' weight is already correct")
+        else:
+            logger.warning("  No CFF or post table weight found; skipping")
+    
+    # ============================================================
     # Line adjustment methods
     # ============================================================
     
@@ -447,8 +517,9 @@ class FontProcessor:
             self.rename_font(font, new_name)
             self.update_unique_id(font, new_name)
             
-            # Fix PANOSE
+            # Fix PANOSE and weight metadata
             self.check_and_fix_panose(font, font_path)
+            self.update_weight_metadata(font, font_path)
 
             if kern:
                 # Handle kerning

@@ -1,5 +1,6 @@
 import sys
 import os
+import subprocess
 from collections import defaultdict
 from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables._k_e_r_n import KernTable_format_0
@@ -184,7 +185,11 @@ def check_and_fix_panose(font, filename):
     matched = False
 
     if "OS/2" not in font:
-        print("  WARNING: No OS/2 table found; cannot check/correct PANOSE.")
+        print("  WARNING: No OS/2 table found; skipping PANOSE check.")
+        return
+
+    if not hasattr(font["OS/2"], "panose") or font["OS/2"].panose is None:
+        print("  WARNING: Font has no PANOSE information; skipping PANOSE check.")
         return
 
     panose = font["OS/2"].panose
@@ -259,9 +264,21 @@ def process_font(path):
     out_path = os.path.join(dirname, f"KC_{filename}")
     try:
         font.save(out_path)
-        print(f"  Saved: {out_path}\n")
+        print(f"  Saved: {out_path}")
+
+        # Run font-line adjustment in-place
+        try:
+            subprocess.run(["font-line", "percent", "20", "--inplace", out_path], check=True)
+            print("  font-line applied in-place (20% baseline shift).")
+        except FileNotFoundError:
+            print("  ERROR: font-line utility not found. Please install it first (see README). Aborting.")
+            sys.exit(1)
+        except Exception as e:
+            print(f"  WARNING: font-line failed: {e}")
     except Exception as e:
-        print(f"  ERROR: Failed to save font: {e}\n")
+        print(f"  ERROR: Failed to save font: {e}")
+
+    print("")
 
 
 # ------------------------------------------------------------
@@ -271,6 +288,21 @@ def process_font(path):
 def main():
     if len(sys.argv) < 2:
         print("Usage: python kobofix.py *.ttf *.otf")
+        sys.exit(1)
+
+    invalid_files = []
+    valid_suffixes = ("-Regular", "-Bold", "-Italic", "-BoldItalic")
+
+    for path in sys.argv[1:]:
+        if os.path.isfile(path) and path.lower().endswith((".ttf", ".otf")):
+            base = os.path.basename(path)
+            if not base.endswith(tuple(s + ext for s in valid_suffixes for ext in (".ttf", ".otf"))):
+                invalid_files.append(base)
+
+    if invalid_files:
+        print("ERROR: The following fonts have invalid filenames (must end with -Regular, -Bold, -Italic, or -BoldItalic):")
+        for f in invalid_files:
+            print("  " + f)
         sys.exit(1)
 
     for path in sys.argv[1:]:

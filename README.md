@@ -1,8 +1,8 @@
-# KoboFix Font Processor
+# Kobo Font Fix
 
 ## Overview
 
-`kobofix.py` is a Python script designed to process TTF and OTF fonts for Kobo e-readers. 
+`kobofix.py` is a Python script designed to process TTF fonts for Kobo e-readers. 
 
 It generates a renamed font, fixes PANOSE information based on the filename, adjusts the baseline with the `font-line` utility, and adds a legacy `kern` table which allows the `kepub` engine for improved rendering of kerned pairs.
 
@@ -37,14 +37,31 @@ source ~/.zshrc
    ```
 3. The script will:
 
-   * Validate filenames.
+   * Validate the file names (must end with `-Regular`, `-Bold`, `-Italic` or `-BoldItalic` so they're valid for Kobo devices).
    * Process each font (e.g. "Lora" becomes "KF Lora").
    * Apply kerning, rename, PANOSE adjustments, and baseline shift.
    * Save output as `KF_<original_filename>`.
 
-Example:
+### Generating KF fonts
 
+This applies the KF prefix, applies 20 percent line spacing and adds a Kobo `kern` table. Ideal if you have an existing TrueType font and you want it on your Kobo device. The `--name` parameter is used to change the name of the font family.
+
+   ```bash
+   ./kobofix.py --prefix KF --name="Fonty" --line-percent 20 *.ttf
+   ```
+
+### Generating NV fonts
+
+Tight spacing, with a custom font family name, as is required via the OFL license:
+
+```bash
+./kobofix.py --prefix NV --name="Fonty" --line-percent 20 --skip-kobo-kern *.ttf
 ```
-Original: Lora-BoldItalic.ttf
-Processed: KF_Lora-BoldItalic.ttf
+
+Relaxed spacing, with a custom font family name, as is required via the OFL license:
+
+```bash
+./kobofix.py --prefix NV --name="Fonty" --line-percent 50 --skip-kobo-kern *.ttf
 ```
+
+You can play around with `--line-percent` to see what works for you.

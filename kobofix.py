@@ -2,7 +2,7 @@
 """
 Font processing utility for Kobo e-readers.
 
-This script processes TrueType/OpenType fonts to improve compatibility with
+This script processes TrueType fonts to improve compatibility with
 Kobo e-readers by:
 - Adding a custom prefix to font names
 - Extracting GPOS kerning data and creating legacy 'kern' tables
@@ -29,8 +29,10 @@ from fontTools.ttLib.tables._k_e_r_n import KernTable_format_0
 # Constants
 DEFAULT_PREFIX = "KF"
 DEFAULT_LINE_PERCENT = 20
+DEFAULT_KOBO_KERN = True
+
 VALID_SUFFIXES = ("-Regular", "-Bold", "-Italic", "-BoldItalic")
-SUPPORTED_EXTENSIONS = (".ttf", ".otf")
+SUPPORTED_EXTENSIONS = (".ttf")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -40,16 +42,18 @@ logger = logging.getLogger(__name__)
 class FontProcessor:
     """Main font processing class."""
     
-    def __init__(self, prefix: str = DEFAULT_PREFIX, line_percent: int = DEFAULT_LINE_PERCENT):
+    def __init__(self, prefix: str = DEFAULT_PREFIX, line_percent: int = DEFAULT_LINE_PERCENT, kobo_kern_fix: bool = DEFAULT_KOBO_KERN):
         """
         Initialize the font processor.
         
         Args:
             prefix: Prefix to add to font names
             line_percent: Percentage for baseline adjustment
+            kobo_kern_fix: Apply `kern` table fix for Kobo devices
         """
         self.prefix = prefix
         self.line_percent = line_percent
+        self.kobo_kern_fix = kobo_kern_fix
     
     # ============================================================
     # Kerning extraction methods
@@ -417,7 +421,7 @@ class FontProcessor:
     # Main processing method
     # ============================================================
     
-    def process_font(self, font_path: str, new_name: Optional[str] = None) -> bool:
+    def process_font(self, kern: bool, font_path: str, new_name: Optional[str] = None) -> bool:
         """
         Process a single font file.
         
@@ -445,17 +449,21 @@ class FontProcessor:
             
             # Fix PANOSE
             self.check_and_fix_panose(font, font_path)
-            
-            # Handle kerning
-            kern_pairs = self.extract_kern_pairs(font)
-            if kern_pairs:
-                written = self.add_legacy_kern(font, kern_pairs)
-                logger.info(
-                    f"  Kerning: extracted {len(kern_pairs)} pairs; "
-                    f"wrote {written} to legacy 'kern' table"
-                )
+
+            if kern:
+                # Handle kerning
+                kern_pairs = self.extract_kern_pairs(font)
+                if kern_pairs:
+                    written = self.add_legacy_kern(font, kern_pairs)
+                    logger.info(
+                        f"  Kerning: extracted {len(kern_pairs)} pairs; "
+                        f"wrote {written} to legacy 'kern' table"
+                    )
+                else:
+                    logger.info("  Kerning: no GPOS kerning found")
             else:
-                logger.info("  Kerning: no GPOS kerning found")
+                # Skip kerning step
+                logger.info("  Skipping `kern` step")
             
             # Generate output filename
             output_path = self._generate_output_path(font_path, new_name)
@@ -538,16 +546,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s font-Regular.ttf font-Bold.ttf
-  %(prog)s --name "My Font" *.ttf
-  %(prog)s --prefix KOBO --line-percent 25 font.ttf
+  %(prog)s --name="Fonty" --line-percent 20 *.ttf
+  %(prog)s --prefix NV --name="Fonty" --line-percent 20 --skip-kobo-kern *.ttf
         """
     )
     
     parser.add_argument(
         "fonts", 
         nargs="+", 
-        help="Font files to process (*.ttf, *.otf)"
+        help="Font files to process (*.ttf)"
     )
     parser.add_argument(
         "--name", 
@@ -565,6 +572,11 @@ Examples:
         type=int, 
         default=DEFAULT_LINE_PERCENT,
         help=f"Line spacing adjustment percentage (default: {DEFAULT_LINE_PERCENT})"
+    )
+    parser.add_argument(
+        "--skip-kobo-kern", 
+        action="store_true",
+        help="Skip the creation of the legacy 'kern' table from GPOS data."
     )
     parser.add_argument(
         "--verbose", 
@@ -601,12 +613,13 @@ Examples:
     # Process fonts
     processor = FontProcessor(
         prefix=args.prefix,
-        line_percent=args.line_percent
+        line_percent=args.line_percent,
     )
     
     success_count = 0
     for font_path in valid_files:
         if processor.process_font(
+            not args.skip_kobo_kern,
             font_path, 
             args.name, 
         ):

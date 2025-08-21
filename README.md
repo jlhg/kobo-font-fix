@@ -30,21 +30,27 @@ source ~/.zshrc
 ## Usage
 
 1. Open a terminal and navigate to the directory containing your font files.
-2. Run the script with a glob pattern to include all TTF/OTF files:
+2. Run the script with a glob pattern to include all TTF files:
 
    ```bash
    python3 kobofix.py *.ttf
    ```
-3. The script will:
+3. The default script will:
 
    * Validate the file names (must end with `-Regular`, `-Bold`, `-Italic` or `-BoldItalic` so they're valid for Kobo devices).
    * Process each font (e.g. "Lora" becomes "KF Lora").
    * Apply kerning, rename, PANOSE adjustments, and baseline shift.
    * Save output as `KF_<original_filename>`.
 
+You can customize what the script does.
+
+## Customization
+
 ### Generating KF fonts
 
-This applies the KF prefix, applies 20 percent line spacing and adds a Kobo `kern` table. Ideal if you have an existing TrueType font and you want it on your Kobo device. The `--name` parameter is used to change the name of the font family.
+This applies the KF prefix, applies 20 percent line spacing and adds a Kobo `kern` table. Ideal if you have an existing TrueType font and you want it on your Kobo device.
+
+The `--name` parameter is used to change the name of the font family.
 
    ```bash
    ./kobofix.py --prefix KF --name="Fonty" --line-percent 20 *.ttf
@@ -52,13 +58,13 @@ This applies the KF prefix, applies 20 percent line spacing and adds a Kobo `ker
 
 ### Generating NV fonts
 
-Tight spacing, with a custom font family name, as is required via the OFL license:
+Tight spacing, with a custom font family name:
 
 ```bash
 ./kobofix.py --prefix NV --name="Fonty" --line-percent 20 --skip-kobo-kern *.ttf
 ```
 
-Relaxed spacing, with a custom font family name, as is required via the OFL license:
+Relaxed spacing, with a custom font family name:
 
 ```bash
 ./kobofix.py --prefix NV --name="Fonty" --line-percent 50 --skip-kobo-kern *.ttf

@@ -1,402 +1,629 @@
+#!/usr/bin/env python3
+"""
+Font processing utility for Kobo e-readers.
+
+This script processes TrueType/OpenType fonts to improve compatibility with
+Kobo e-readers by:
+- Adding a custom prefix to font names
+- Extracting GPOS kerning data and creating legacy 'kern' tables
+- Validating and correcting PANOSE metadata
+- Adjusting font metrics for better line spacing
+
+Requirements:
+- fontTools (pip install fonttools)
+- font-line utility (https://github.com/source-foundry/font-line)
+"""
+
 import sys
 import os
 import subprocess
 import argparse
+import logging
+from pathlib import Path
 from collections import defaultdict
+from typing import Dict, Tuple, Optional, List
+
 from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables._k_e_r_n import KernTable_format_0
 
-# ------------------------------------------------------------
-# Kerning extraction
-# ------------------------------------------------------------
+# Constants
+DEFAULT_PREFIX = "KoFi"
+DEFAULT_LINE_PERCENT = 20
+VALID_SUFFIXES = ("-Regular", "-Bold", "-Italic", "-BoldItalic")
+SUPPORTED_EXTENSIONS = (".ttf", ".otf")
 
-def _pair_value_to_kern(v1, v2):
-    """Compute a legacy kerning value from a GPOS PairValue (Value1/Value2).
-    Prefer XAdvance adjustments; if none, fall back to XPlacement.
-    Returns an int (may be negative). """
-    val = 0
-    if v1 is not None:
-        val += getattr(v1, "XAdvance", 0) or 0
-    if v2 is not None:
-        val += getattr(v2, "XAdvance", 0) or 0
-    if val == 0:
-        # Some fonts encode kerning via placements only
-        if v1 is not None:
-            val += getattr(v1, "XPlacement", 0) or 0
-        if v2 is not None:
-            val += getattr(v2, "XPlacement", 0) or 0
-    return int(val or 0)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
 
 
-def extract_kern_pairs(font):
-    """Extract kerning pairs from GPOS PairPos lookups (Format 1 & 2).
-
-    Returns:
-        dict[(leftGlyphName, rightGlyphName)] -> int kerning value
-    Safe against missing GPOS or unexpected structures.
-    """
-    pairs = defaultdict(int)
-
-    if "GPOS" not in font:
-        return {}
-
-    gpos = font["GPOS"].table
-    lookup_list = getattr(gpos, "LookupList", None)
-    if not lookup_list or not lookup_list.Lookup:
-        return {}
-
-    for lookup in lookup_list.Lookup:
-        if getattr(lookup, "LookupType", None) != 2:  # Pair Adjustment
-            continue
-        for subtable in getattr(lookup, "SubTable", []):
-            fmt = getattr(subtable, "Format", None)
-            # -------- PairPos Format 1: per-glyph PairSets --------
-            if fmt == 1:
-                coverage = getattr(subtable, "Coverage", None)
-                pair_sets = getattr(subtable, "PairSet", [])
-                if not coverage or not hasattr(coverage, "glyphs"):
-                    continue
-                cov_glyphs = coverage.glyphs
-                for i, left in enumerate(cov_glyphs):
-                    if i >= len(pair_sets):
-                        break
-                    for rec in getattr(pair_sets[i], "PairValueRecord", []):
-                        right = rec.SecondGlyph
-                        k = _pair_value_to_kern(rec.Value1, rec.Value2)
-                        if k:
-                            pairs[(left, right)] += k
-            # -------- PairPos Format 2: class-based --------
-            elif fmt == 2:
-                coverage = getattr(subtable, "Coverage", None)
-                class_def1 = getattr(subtable, "ClassDef1", None)
-                class_def2 = getattr(subtable, "ClassDef2", None)
-                class1_records = getattr(subtable, "Class1Record", [])
-
-                if not coverage or not hasattr(coverage, "glyphs"):
-                    continue
-                cov_glyphs = coverage.glyphs
-
-                # Build glyph lists per class for the left side, limited to covered glyphs
-                class1_map = getattr(class_def1, "classDefs", {}) if class_def1 else {}
-                left_by_class = defaultdict(list)
-                for g in cov_glyphs:
-                    c = class1_map.get(g, 0)
-                    left_by_class[c].append(g)
-
-                # Build glyph lists per class for the right side from explicit definitions only
-                class2_map = getattr(class_def2, "classDefs", {}) if class_def2 else {}
-                right_by_class = defaultdict(list)
-                for g, c in class2_map.items():
-                    right_by_class[c].append(g)
-
-                for c1, c1rec in enumerate(class1_records):
-                    lefts = left_by_class.get(c1, [])
-                    if not lefts:
-                        continue
-                    for c2, c2rec in enumerate(c1rec.Class2Record):
-                        rights = right_by_class.get(c2, [])
-                        if not rights:
-                            continue
-                        k = _pair_value_to_kern(c2rec.Value1, c2rec.Value2)
-                        if not k:
-                            continue
-                        for L in lefts:
-                            for R in rights:
-                                pairs[(L, R)] += k
-            else:
-                # Other formats not handled
-                continue
-
-    return dict(pairs)
-
-
-# ------------------------------------------------------------
-# Legacy 'kern' table builder
-# ------------------------------------------------------------
-
-def add_legacy_kern(font, kern_pairs):
-    """Create/replace a legacy 'kern' table with the supplied pairs.
-    """
-    if not kern_pairs:
-        # Remove existing legacy 'kern' if present? We'll leave as-is.
-        return 0
-
-    kern_table = newTable("kern")
-    kern_table.version = 0
-    kern_table.kernTables = []
-
-    subtable = KernTable_format_0()
-    subtable.version = 0
-    subtable.length = None  # recalculated by fontTools
-    subtable.coverage = 1  # horizontal kerning, format 0
-    # Ensure ints and glyph-name tuple keys
-    subtable.kernTable = {tuple(k): int(v) for k, v in kern_pairs.items() if v}
-
-    kern_table.kernTables.append(subtable)
-    font["kern"] = kern_table
-    return len(subtable.kernTable)
-
-
-# ------------------------------------------------------------
-# Name table updates
-# ------------------------------------------------------------
-
-def rename_font(font, prefix, new_name=None):
-    """
-    Prefix the font's family/full names with a given prefix.
-    Optionally override the font name entirely using new_name.
-    Updates name IDs:
-      - 1: Family Name
-      - 4: Full Name
-      - 16: Typographic Family
-    """
-    if "name" not in font:
-        return
-
-    name_table = font["name"]
-    ids_to_prefix = {1, 4, 16}
-
-    for record in name_table.names:
-        if record.nameID in ids_to_prefix:
-            try:
-                base_name = new_name if new_name else record.toUnicode()
-                new_record_name = f"{prefix} {base_name}"
-                record.string = new_record_name.encode(record.getEncoding())
-            except Exception:
-                # Fallback encoding if getEncoding fails
-                try:
-                    record.string = new_record_name.encode("utf_16_be")
-                except Exception:
-                    pass
-
-
-def update_unique_id(font, prefix, new_name=None):
-    """
-    Automatically prefix the font's Unique ID (nameID 3) with a given prefix.
-    Optionally override the font name using new_name.
-    Preserves version info if present, otherwise sets a default version.
-    Updates all records for all platforms/encodings.
-    """
-    if "name" not in font:
-        return
-
-    for record in font["name"].names:
-        if record.nameID == 3:
-            try:
-                current_unique = record.toUnicode()
-                # Preserve version info if present
-                parts = current_unique.split("Version")
-                version_info = "Version" + parts[1] if len(parts) == 2 else "Version 1.000"
-                base_name = new_name if new_name else parts[0].strip()
-                new_unique_id = f"{prefix} {base_name}:{version_info}"
-                record.string = new_unique_id.encode(record.getEncoding())
-            except Exception:
-                # Fallback encoding
-                try:
-                    record.string = new_unique_id.encode("utf_16_be")
-                except Exception:
-                    pass
-
-
-# ------------------------------------------------------------
-# PANOSE check & fix
-# ------------------------------------------------------------
-
-def check_and_fix_panose(font, filename):
-    """Check and adjust PANOSE based on filename suffix.
-
-    Expected suffixes: -Regular, -Bold, -Italic, -BoldItalic
-    Adjusts bWeight for Bold/Regular and bLetterForm for Italic/Regular.
-    Prints status and corrections performed.
-    """
-    # Order matters: test BoldItalic before Bold/Italic
-    expected_styles = (
-        ("-BoldItalic", {"weight": 8, "letterform": 3}),
-        ("-Bold", {"weight": 8, "letterform": 2}),
-        ("-Italic", {"weight": 5, "letterform": 3}),
-        ("-Regular", {"weight": 5, "letterform": 2}),
-    )
-
-    base = os.path.basename(filename)
-    matched = False
-
-    if "OS/2" not in font:
-        print("  WARNING: No OS/2 table found; skipping PANOSE check.")
-        return
-
-    if not hasattr(font["OS/2"], "panose") or font["OS/2"].panose is None:
-        print("  WARNING: Font has no PANOSE information; skipping PANOSE check.")
-        return
-
-    panose = font["OS/2"].panose
-
-    for suffix, expected in expected_styles:
-        if base.endswith(suffix + ".ttf") or base.endswith(suffix + ".otf"):
-            matched = True
-            exp_w = expected["weight"]
-            exp_lf = expected["letterform"]
-            cur_w = getattr(panose, "bWeight", None)
-            cur_lf = getattr(panose, "bLetterForm", None)
-
-            changes = []
-            if cur_w != exp_w and exp_w is not None:
-                panose.bWeight = exp_w
-                changes.append(f"bWeight {cur_w}→{exp_w}")
-            if cur_lf != exp_lf and exp_lf is not None:
-                panose.bLetterForm = exp_lf
-                changes.append(f"bLetterForm {cur_lf}→{exp_lf}")
-
-            if changes:
-                print(f"  PANOSE corrected for {suffix}: " + ", ".join(changes))
-            else:
-                print(f"  PANOSE check passed for {suffix}.")
-            break
-
-    if not matched:
-        print(
-            "  WARNING: Filename does not end with expected suffix "
-            "(-Regular, -Bold, -Italic, -BoldItalic). PANOSE check skipped."
-        )
-
-
-# ------------------------------------------------------------
-# Orchestration per font
-# ------------------------------------------------------------
-
-def process_font(path, new_name):
-    """Load, process, and save the font.
-
-    Steps (each independent):
-      1) Prefix names with prefix.
-      2) Check & fix PANOSE based on filename.
-      3) Extract kerning from GPOS and write a legacy 'kern' table.
-      4) Save as PREFIX_<original>.<ext>
-    """
-    print(f"Processing: {path}")
-    try:
-        font = TTFont(path)
-    except Exception as e:
-        print(f"  ERROR: Failed to open font: {e}")
-        return
-
-    # Set up a prefix
-    prefix = "KF"
-
-    # Always run name prefix & PANOSE checks, regardless of kerning outcome
-    rename_font(font, prefix, new_name)
-    update_unique_id(font, prefix, new_name)
-    check_and_fix_panose(font, os.path.basename(path))
-
-    # Extract kerning (robust against missing/odd structures)
-    try:
-        kern_pairs = extract_kern_pairs(font)
-        pair_count = len(kern_pairs)
-        if pair_count:
-            written = add_legacy_kern(font, kern_pairs)
-            print(f"  Kerning: extracted {pair_count} pairs; wrote {written} pairs to legacy 'kern'.")
-        else:
-            print("  Kerning: no GPOS kerning found; skipping legacy 'kern' table.")
-    except Exception as e:
-        print(f"  WARNING: Failed to extract/add kerning: {e}")
-
-    # Save the font with prefix, optional new name, and preserve style suffix
-    dirname, _ = os.path.split(path)
-    original_name, ext = os.path.splitext(os.path.basename(path))
-
-    # Detect the style suffix
-    valid_suffixes = ("-Regular", "-Bold", "-Italic", "-BoldItalic")
-    suffix = next((s for s in valid_suffixes if original_name.endswith(s)), "")
-
-    # Determine base name for the file
-    if new_name:
-        # Replace spaces with underscores for filenames
-        base_name = f"{prefix}_{new_name.replace(' ', '_')}{suffix}"
-    else:
-        # Keep original name but add prefix
-        base_name = f"{prefix}_{original_name}"
-
-    # Construct the full output path
-    out_path = os.path.join(dirname, f"{base_name}{ext.lower()}")
-
+class FontProcessor:
+    """Main font processing class."""
     
-    try:
-        font.save(out_path)
-        print(f"  Saved: {out_path}")
-
-        # Run font-line adjustment in-place
+    def __init__(self, prefix: str = DEFAULT_PREFIX, line_percent: int = DEFAULT_LINE_PERCENT):
+        """
+        Initialize the font processor.
+        
+        Args:
+            prefix: Prefix to add to font names
+            line_percent: Percentage for baseline adjustment
+        """
+        self.prefix = prefix
+        self.line_percent = line_percent
+    
+    # ============================================================
+    # Kerning extraction methods
+    # ============================================================
+    
+    @staticmethod
+    def _pair_value_to_kern(value1, value2) -> int:
+        """
+        Compute a legacy kerning value from GPOS PairValue records.
+        
+        Args:
+            value1: First value record
+            value2: Second value record
+            
+        Returns:
+            Integer kerning value (may be negative)
+        """
+        kern_value = 0
+        
+        # Prefer XAdvance adjustments
+        if value1 is not None:
+            kern_value += getattr(value1, "XAdvance", 0) or 0
+        if value2 is not None:
+            kern_value += getattr(value2, "XAdvance", 0) or 0
+        
+        # Fall back to XPlacement if no XAdvance
+        if kern_value == 0:
+            if value1 is not None:
+                kern_value += getattr(value1, "XPlacement", 0) or 0
+            if value2 is not None:
+                kern_value += getattr(value2, "XPlacement", 0) or 0
+        
+        return int(kern_value)
+    
+    def _extract_format1_pairs(self, subtable) -> Dict[Tuple[str, str], int]:
+        """Extract kerning pairs from PairPos Format 1 (per-glyph PairSets)."""
+        pairs = defaultdict(int)
+        
+        coverage = getattr(subtable, "Coverage", None)
+        pair_sets = getattr(subtable, "PairSet", [])
+        
+        if not coverage or not hasattr(coverage, "glyphs"):
+            return pairs
+        
+        for idx, left_glyph in enumerate(coverage.glyphs):
+            if idx >= len(pair_sets):
+                break
+            
+            for record in getattr(pair_sets[idx], "PairValueRecord", []):
+                right_glyph = record.SecondGlyph
+                kern_value = self._pair_value_to_kern(record.Value1, record.Value2)
+                if kern_value:
+                    pairs[(left_glyph, right_glyph)] += kern_value
+        
+        return pairs
+    
+    def _extract_format2_pairs(self, subtable) -> Dict[Tuple[str, str], int]:
+        """Extract kerning pairs from PairPos Format 2 (class-based)."""
+        pairs = defaultdict(int)
+        
+        coverage = getattr(subtable, "Coverage", None)
+        class_def1 = getattr(subtable, "ClassDef1", None)
+        class_def2 = getattr(subtable, "ClassDef2", None)
+        class1_records = getattr(subtable, "Class1Record", [])
+        
+        if not coverage or not hasattr(coverage, "glyphs"):
+            return pairs
+        
+        # Build left-side glyph lists per class
+        class1_map = getattr(class_def1, "classDefs", {}) if class_def1 else {}
+        left_by_class = defaultdict(list)
+        for glyph in coverage.glyphs:
+            class_idx = class1_map.get(glyph, 0)
+            left_by_class[class_idx].append(glyph)
+        
+        # Build right-side glyph lists per class
+        class2_map = getattr(class_def2, "classDefs", {}) if class_def2 else {}
+        right_by_class = defaultdict(list)
+        for glyph, class_idx in class2_map.items():
+            right_by_class[class_idx].append(glyph)
+        
+        # Extract kerning values
+        for class1_idx, class1_record in enumerate(class1_records):
+            left_glyphs = left_by_class.get(class1_idx, [])
+            if not left_glyphs:
+                continue
+            
+            for class2_idx, class2_record in enumerate(class1_record.Class2Record):
+                right_glyphs = right_by_class.get(class2_idx, [])
+                if not right_glyphs:
+                    continue
+                
+                kern_value = self._pair_value_to_kern(
+                    class2_record.Value1, 
+                    class2_record.Value2
+                )
+                if not kern_value:
+                    continue
+                
+                for left in left_glyphs:
+                    for right in right_glyphs:
+                        pairs[(left, right)] += kern_value
+        
+        return pairs
+    
+    def extract_kern_pairs(self, font: TTFont) -> Dict[Tuple[str, str], int]:
+        """
+        Extract all kerning pairs from GPOS PairPos lookups.
+        
+        Args:
+            font: Font object to extract kerning from
+            
+        Returns:
+            Dictionary mapping glyph pairs to kerning values
+        """
+        pairs = defaultdict(int)
+        
+        if "GPOS" not in font:
+            return {}
+        
+        gpos = font["GPOS"].table
+        lookup_list = getattr(gpos, "LookupList", None)
+        
+        if not lookup_list or not lookup_list.Lookup:
+            return {}
+        
+        for lookup in lookup_list.Lookup:
+            # Only process Pair Adjustment lookups (type 2)
+            if getattr(lookup, "LookupType", None) != 2:
+                continue
+            
+            for subtable in getattr(lookup, "SubTable", []):
+                fmt = getattr(subtable, "Format", None)
+                
+                if fmt == 1:
+                    format1_pairs = self._extract_format1_pairs(subtable)
+                    for key, value in format1_pairs.items():
+                        pairs[key] += value
+                elif fmt == 2:
+                    format2_pairs = self._extract_format2_pairs(subtable)
+                    for key, value in format2_pairs.items():
+                        pairs[key] += value
+        
+        return dict(pairs)
+    
+    # ============================================================
+    # Legacy kern table methods
+    # ============================================================
+    
+    @staticmethod
+    def add_legacy_kern(font: TTFont, kern_pairs: Dict[Tuple[str, str], int]) -> int:
+        """
+        Create or replace a legacy 'kern' table with the supplied pairs.
+        
+        Args:
+            font: Font object to modify
+            kern_pairs: Dictionary of kerning pairs
+            
+        Returns:
+            Number of kern pairs written
+        """
+        if not kern_pairs:
+            return 0
+        
+        kern_table = newTable("kern")
+        kern_table.version = 0
+        kern_table.kernTables = []
+        
+        subtable = KernTable_format_0()
+        subtable.version = 0
+        subtable.length = None  # Recalculated by fontTools
+        subtable.coverage = 1  # Horizontal kerning, format 0
+        
+        # Ensure proper types for kern table
+        subtable.kernTable = {
+            tuple(k): int(v) 
+            for k, v in kern_pairs.items() 
+            if v  # Only include non-zero values
+        }
+        
+        kern_table.kernTables.append(subtable)
+        font["kern"] = kern_table
+        
+        return len(subtable.kernTable)
+    
+    # ============================================================
+    # Name table methods
+    # ============================================================
+    
+    def rename_font(self, font: TTFont, new_name: Optional[str] = None) -> None:
+        """
+        Prefix the font's family and full names.
+        
+        Args:
+            font: Font object to modify
+            new_name: Optional override for the font name
+        """
+        if "name" not in font:
+            return
+        
+        name_table = font["name"]
+        # Name IDs: 1=Family, 4=Full Name, 16=Typographic Family
+        ids_to_update = {1, 4, 16}
+        
+        for record in name_table.names:
+            if record.nameID in ids_to_update:
+                try:
+                    base_name = new_name if new_name else record.toUnicode()
+                    new_record_name = f"{self.prefix} {base_name}"
+                    record.string = new_record_name.encode(record.getEncoding())
+                except Exception:
+                    # Fallback to UTF-16 BE encoding
+                    try:
+                        record.string = new_record_name.encode("utf_16_be")
+                    except Exception:
+                        logger.warning(f"Failed to update name ID {record.nameID}")
+    
+    def update_unique_id(self, font: TTFont, new_name: Optional[str] = None) -> None:
+        """
+        Update the font's Unique ID (nameID 3) with prefix.
+        
+        Args:
+            font: Font object to modify
+            new_name: Optional override for the font name
+        """
+        if "name" not in font:
+            return
+        
+        for record in font["name"].names:
+            if record.nameID == 3:  # Unique ID
+                try:
+                    current_unique = record.toUnicode()
+                    # Preserve version info if present
+                    parts = current_unique.split("Version")
+                    version_info = f"Version{parts[1]}" if len(parts) == 2 else "Version 1.000"
+                    base_name = new_name if new_name else parts[0].strip()
+                    new_unique_id = f"{self.prefix} {base_name}:{version_info}"
+                    record.string = new_unique_id.encode(record.getEncoding())
+                except Exception:
+                    try:
+                        record.string = new_unique_id.encode("utf_16_be")
+                    except Exception:
+                        logger.warning("Failed to update Unique ID")
+    
+    # ============================================================
+    # PANOSE methods
+    # ============================================================
+    
+    @staticmethod
+    def check_and_fix_panose(font: TTFont, filename: str) -> None:
+        """
+        Check and adjust PANOSE values based on filename suffix.
+        
+        Args:
+            font: Font object to modify
+            filename: Font filename to check suffix
+        """
+        # PANOSE expected values for each style
+        style_specs = {
+            "-BoldItalic": {"weight": 8, "letterform": 3},
+            "-Bold": {"weight": 8, "letterform": 2},
+            "-Italic": {"weight": 5, "letterform": 3},
+            "-Regular": {"weight": 5, "letterform": 2},
+        }
+        
+        if "OS/2" not in font:
+            logger.warning("  No OS/2 table found; skipping PANOSE check")
+            return
+        
+        if not hasattr(font["OS/2"], "panose") or font["OS/2"].panose is None:
+            logger.warning("  No PANOSE information; skipping PANOSE check")
+            return
+        
+        panose = font["OS/2"].panose
+        base_filename = os.path.basename(filename)
+        
+        # Find matching style
+        matched_style = None
+        for style, specs in style_specs.items():
+            if style in base_filename:
+                matched_style = style
+                expected = specs
+                break
+        
+        if not matched_style:
+            logger.warning(
+                f"  Filename doesn't match expected patterns {list(style_specs.keys())}. "
+                "PANOSE check skipped"
+            )
+            return
+        
+        # Check and fix values
+        changes = []
+        current_weight = getattr(panose, "bWeight", None)
+        current_letterform = getattr(panose, "bLetterForm", None)
+        
+        if current_weight != expected["weight"]:
+            panose.bWeight = expected["weight"]
+            changes.append(f"bWeight {current_weight}->{expected['weight']}")
+        
+        if current_letterform != expected["letterform"]:
+            panose.bLetterForm = expected["letterform"]
+            changes.append(f"bLetterForm {current_letterform}->{expected['letterform']}")
+        
+        if changes:
+            logger.info(f"  PANOSE corrected for {matched_style}: {', '.join(changes)}")
+        else:
+            logger.info(f"  PANOSE check passed for {matched_style}")
+    
+    # ============================================================
+    # Line adjustment methods
+    # ============================================================
+    
+    def apply_line_adjustment(self, font_path: str) -> bool:
+        """
+        Apply font-line baseline adjustment to the font.
+        
+        Args:
+            font_path: Path to the font file
+            
+        Returns:
+            True if successful, False otherwise
+        """
         try:
-            subprocess.run(["font-line", "percent", "20", out_path], check=True, stdout=subprocess.DEVNULL)
-            # Determine the expected linegap filename
-            base, ext = os.path.splitext(out_path)
-            linegap_file = f"{base}-linegap20{ext}"
-
-            # Remove the original font
-            if os.path.exists(out_path):
-                os.remove(out_path)
-
-            # Rename the linegap file back to the original output path
+            # Check if font-line is available
+            result = subprocess.run(
+                ["which", "font-line"], 
+                capture_output=True, 
+                text=True
+            )
+            if result.returncode != 0:
+                logger.error("  font-line utility not found. Please install it first")
+                logger.error("  See: https://github.com/source-foundry/font-line")
+                return False
+            
+            # Apply font-line adjustment
+            subprocess.run(
+                ["font-line", "percent", str(self.line_percent), font_path],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE
+            )
+            
+            # Handle the renamed output file
+            base, ext = os.path.splitext(font_path)
+            linegap_file = f"{base}-linegap{self.line_percent}{ext}"
+            
             if os.path.exists(linegap_file):
-                os.rename(linegap_file, out_path)
-                print("  font-line applied successfully (20% baseline shift).")
+                os.remove(font_path)
+                os.rename(linegap_file, font_path)
+                logger.info(f"  Line spacing adjusted ({self.line_percent}% baseline shift)")
+                return True
             else:
-                print(f"  WARNING: expected font-line output '{linegap_file}' not found.")
-        except FileNotFoundError:
-            print("  ERROR: font-line utility not found. Please install it first (see README). Aborting.")
-            sys.exit(1)
+                logger.warning(f"  Expected font-line output '{linegap_file}' not found")
+                return False
+                
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"  font-line failed: {e}")
+            return False
         except Exception as e:
-            print(f"  WARNING: font-line failed: {e}")
-    except Exception as e:
-        print(f"  ERROR: Failed to save font: {e}")
+            logger.warning(f"  Unexpected error during line adjustment: {e}")
+            return False
+    
+    # ============================================================
+    # Main processing method
+    # ============================================================
+    
+    def process_font(self, font_path: str, new_name: Optional[str] = None) -> bool:
+        """
+        Process a single font file.
+        
+        Args:
+            font_path: Path to the font file
+            new_name: Optional new family name
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        logger.info(f"\nProcessing: {font_path}")
+        
+        # Load font
+        try:
+            font = TTFont(font_path)
+        except Exception as e:
+            logger.error(f"  Failed to open font: {e}")
+            return False
+        
+        # Process font
+        try:
+            # Update names
+            self.rename_font(font, new_name)
+            self.update_unique_id(font, new_name)
+            
+            # Fix PANOSE
+            self.check_and_fix_panose(font, font_path)
+            
+            # Handle kerning
+            kern_pairs = self.extract_kern_pairs(font)
+            if kern_pairs:
+                written = self.add_legacy_kern(font, kern_pairs)
+                logger.info(
+                    f"  Kerning: extracted {len(kern_pairs)} pairs; "
+                    f"wrote {written} to legacy 'kern' table"
+                )
+            else:
+                logger.info("  Kerning: no GPOS kerning found")
+            
+            # Generate output filename
+            output_path = self._generate_output_path(font_path, new_name)
+            
+            # Save modified font
+            font.save(output_path)
+            logger.info(f"  Saved: {output_path}")
+            
+            # Apply line adjustments
+            self.apply_line_adjustment(output_path)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"  Processing failed: {e}")
+            return False
+    
+    def _generate_output_path(self, original_path: str, new_name: Optional[str]) -> str:
+        """Generate the output path for the processed font."""
+        dirname = os.path.dirname(original_path)
+        original_name, ext = os.path.splitext(os.path.basename(original_path))
+        
+        # Detect style suffix
+        suffix = ""
+        for valid_suffix in VALID_SUFFIXES:
+            if original_name.endswith(valid_suffix):
+                suffix = valid_suffix
+                break
+        
+        # Build new filename
+        if new_name:
+            base_name = f"{self.prefix}_{new_name.replace(' ', '_')}{suffix}"
+        else:
+            base_name = f"{self.prefix}_{original_name}"
+        
+        return os.path.join(dirname, f"{base_name}{ext.lower()}")
 
-# ------------------------------------------------------------
-# CLI
-# ------------------------------------------------------------
+
+def validate_font_files(font_paths: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Validate font files for processing.
+    
+    Args:
+        font_paths: List of font file paths
+        
+    Returns:
+        Tuple of (valid_files, invalid_files)
+    """
+    valid_files = []
+    invalid_files = []
+    
+    for path in font_paths:
+        if not os.path.isfile(path):
+            logger.warning(f"File not found: {path}")
+            continue
+        
+        if not path.lower().endswith(SUPPORTED_EXTENSIONS):
+            logger.warning(f"Unsupported file type: {path}")
+            continue
+        
+        # Check for valid suffix
+        basename = os.path.basename(path)
+        has_valid_suffix = any(
+            suffix in basename for suffix in VALID_SUFFIXES
+        )
+        
+        if has_valid_suffix:
+            valid_files.append(path)
+        else:
+            invalid_files.append(basename)
+    
+    return valid_files, invalid_files
+
 
 def main():
-    import argparse
-
-    # --------------------------
-    # Parse command-line arguments
-    # --------------------------
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Process fonts: add KC prefix, kern table, PANOSE validation, line adjustments."
+        description="Process fonts for Kobo e-readers: add prefix, kern table, "
+                   "PANOSE validation, and line adjustments.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s font-Regular.ttf font-Bold.ttf
+  %(prog)s --name "My Font" *.ttf
+  %(prog)s --prefix KOBO --line-percent 25 font.ttf
+        """
+    )
+    
+    parser.add_argument(
+        "fonts", 
+        nargs="+", 
+        help="Font files to process (*.ttf, *.otf)"
     )
     parser.add_argument(
-        "fonts", nargs="+", help="Font files to process (*.ttf, *.otf)"
+        "--name", 
+        type=str, 
+        help="Optional new family name for all fonts"
     )
     parser.add_argument(
-        "--name", type=str, help="Optional new family name for all fonts"
+        "--prefix", 
+        type=str, 
+        default=DEFAULT_PREFIX,
+        help=f"Prefix to add to font names (default: {DEFAULT_PREFIX})"
     )
+    parser.add_argument(
+        "--line-percent", 
+        type=int, 
+        default=DEFAULT_LINE_PERCENT,
+        help=f"Line spacing adjustment percentage (default: {DEFAULT_LINE_PERCENT})"
+    )
+    parser.add_argument(
+        "--no-backup", 
+        action="store_true",
+        help="Don't create backup files before processing"
+    )
+    parser.add_argument(
+        "--verbose", 
+        action="store_true",
+        help="Enable verbose output"
+    )
+    
     args = parser.parse_args()
-
-    # --------------------------
-    # Validate filenames
-    # --------------------------
-    invalid_files = []
-    valid_suffixes = ("-Regular", "-Bold", "-Italic", "-BoldItalic")
-
-    for path in args.fonts:
-        if os.path.isfile(path) and path.lower().endswith((".ttf", ".otf")):
-            base = os.path.basename(path)
-            if not base.endswith(tuple(s + ext for s in valid_suffixes for ext in (".ttf", ".otf"))):
-                invalid_files.append(base)
-        else:
-            print(f"Skipping non-TTF/OTF file: {path}")
-
+    
+    # Configure logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Validate files
+    valid_files, invalid_files = validate_font_files(args.fonts)
+    
     if invalid_files:
-        print(
-            "ERROR: The following fonts have invalid filenames (must end with -Regular, -Bold, -Italic, or -BoldItalic):"
-        )
-        for f in invalid_files:
-            print("  " + f)
+        logger.error("\nERROR: The following fonts have invalid filenames:")
+        logger.error("(Must end with -Regular, -Bold, -Italic, or -BoldItalic)")
+        for filename in invalid_files:
+            logger.error(f"  {filename}")
+        
+        if not valid_files:
+            sys.exit(1)
+        
+        response = input("\nContinue with valid files only? [y/N]: ")
+        if response.lower() != 'y':
+            sys.exit(1)
+    
+    if not valid_files:
+        logger.error("No valid font files to process")
         sys.exit(1)
-
-    # --------------------------
-    # Process each font
-    # --------------------------
-    for path in args.fonts:
-        if os.path.isfile(path) and path.lower().endswith((".ttf", ".otf")):
-            process_font(path, new_name=args.name)
+    
+    # Process fonts
+    processor = FontProcessor(
+        prefix=args.prefix,
+        line_percent=args.line_percent
+    )
+    
+    success_count = 0
+    for font_path in valid_files:
+        if processor.process_font(
+            font_path, 
+            args.name, 
+            backup=not args.no_backup
+        ):
+            success_count += 1
+    
+    # Summary
+    logger.info(f"\n{'='*50}")
+    logger.info(f"Processed {success_count}/{len(valid_files)} fonts successfully")
+    
+    if success_count < len(valid_files):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

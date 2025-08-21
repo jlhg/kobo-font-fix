@@ -1,6 +1,7 @@
 import sys
 import os
 import subprocess
+import argparse
 from collections import defaultdict
 from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables._k_e_r_n import KernTable_format_0
@@ -140,48 +141,61 @@ def add_legacy_kern(font, kern_pairs):
 # Name table updates
 # ------------------------------------------------------------
 
-def rename_font(font, prefix):
-    """Prefix the font's family/full names with a given prefix.
-    Updates name IDs 1 (Family), 4 (Full), and 16 (Typographic Family) when present.
+def rename_font(font, prefix, new_name=None):
+    """
+    Prefix the font's family/full names with a given prefix.
+    Optionally override the font name entirely using new_name.
+    Updates name IDs:
+      - 1: Family Name
+      - 4: Full Name
+      - 16: Typographic Family
     """
     if "name" not in font:
         return
+
     name_table = font["name"]
     ids_to_prefix = {1, 4, 16}
+
     for record in name_table.names:
         if record.nameID in ids_to_prefix:
             try:
-                new_name = prefix + " " + record.toUnicode()
-                record.string = new_name.encode(record.getEncoding())
+                base_name = new_name if new_name else record.toUnicode()
+                new_record_name = f"{prefix} {base_name}"
+                record.string = new_record_name.encode(record.getEncoding())
             except Exception:
                 # Fallback encoding if getEncoding fails
                 try:
-                    record.string = (prefix + " " + record.toUnicode()).encode("utf_16_be")
+                    record.string = new_record_name.encode("utf_16_be")
                 except Exception:
                     pass
 
-def update_unique_id(font, prefix):
+
+def update_unique_id(font, prefix, new_name=None):
     """
     Automatically prefix the font's Unique ID (nameID 3) with a given prefix.
-    Keeps the version info if present, or sets a default if missing.
+    Optionally override the font name using new_name.
+    Preserves version info if present, otherwise sets a default version.
     Updates all records for all platforms/encodings.
     """
+    if "name" not in font:
+        return
+
     for record in font["name"].names:
         if record.nameID == 3:
-            current_unique = record.toUnicode()
-            
-            # Split at 'Version' to preserve version info if it exists
-            parts = current_unique.split("Version")
-            if len(parts) == 2:
-                version_info = "Version" + parts[1]
-            else:
-                version_info = "Version 1.000"  # fallback
-            
-            # Build new Unique ID with prefix
-            new_unique_id = prefix + " " + parts[0].strip() + ":" + version_info
-            
-            # Update the record safely with proper encoding
-            record.string = new_unique_id.encode(record.getEncoding())
+            try:
+                current_unique = record.toUnicode()
+                # Preserve version info if present
+                parts = current_unique.split("Version")
+                version_info = "Version" + parts[1] if len(parts) == 2 else "Version 1.000"
+                base_name = new_name if new_name else parts[0].strip()
+                new_unique_id = f"{prefix} {base_name}:{version_info}"
+                record.string = new_unique_id.encode(record.getEncoding())
+            except Exception:
+                # Fallback encoding
+                try:
+                    record.string = new_unique_id.encode("utf_16_be")
+                except Exception:
+                    pass
 
 
 # ------------------------------------------------------------
@@ -249,7 +263,7 @@ def check_and_fix_panose(font, filename):
 # Orchestration per font
 # ------------------------------------------------------------
 
-def process_font(path):
+def process_font(path, new_name):
     """Load, process, and save the font.
 
     Steps (each independent):
@@ -269,8 +283,8 @@ def process_font(path):
     prefix = "KF"
 
     # Always run name prefix & PANOSE checks, regardless of kerning outcome
-    rename_font(font, prefix)
-    update_unique_id(font, prefix)
+    rename_font(font, prefix, new_name)
+    update_unique_id(font, prefix, new_name)
     check_and_fix_panose(font, os.path.basename(path))
 
     # Extract kerning (robust against missing/odd structures)
@@ -285,9 +299,26 @@ def process_font(path):
     except Exception as e:
         print(f"  WARNING: Failed to extract/add kerning: {e}")
 
-    # Save
-    dirname, filename = os.path.split(path)
-    out_path = os.path.join(dirname, f"{prefix}_{filename}")
+    # Save the font with prefix, optional new name, and preserve style suffix
+    dirname, _ = os.path.split(path)
+    original_name, ext = os.path.splitext(os.path.basename(path))
+
+    # Detect the style suffix
+    valid_suffixes = ("-Regular", "-Bold", "-Italic", "-BoldItalic")
+    suffix = next((s for s in valid_suffixes if original_name.endswith(s)), "")
+
+    # Determine base name for the file
+    if new_name:
+        # Replace spaces with underscores for filenames
+        base_name = f"{prefix}_{new_name.replace(' ', '_')}{suffix}"
+    else:
+        # Keep original name but add prefix
+        base_name = f"{prefix}_{original_name}"
+
+    # Construct the full output path
+    out_path = os.path.join(dirname, f"{base_name}{ext.lower()}")
+
+    
     try:
         font.save(out_path)
         print(f"  Saved: {out_path}")
@@ -322,30 +353,50 @@ def process_font(path):
 # ------------------------------------------------------------
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python kobofix.py *.ttf *.otf")
-        sys.exit(1)
+    import argparse
 
+    # --------------------------
+    # Parse command-line arguments
+    # --------------------------
+    parser = argparse.ArgumentParser(
+        description="Process fonts: add KC prefix, kern table, PANOSE validation, line adjustments."
+    )
+    parser.add_argument(
+        "fonts", nargs="+", help="Font files to process (*.ttf, *.otf)"
+    )
+    parser.add_argument(
+        "--name", type=str, help="Optional new family name for all fonts"
+    )
+    args = parser.parse_args()
+
+    # --------------------------
+    # Validate filenames
+    # --------------------------
     invalid_files = []
     valid_suffixes = ("-Regular", "-Bold", "-Italic", "-BoldItalic")
 
-    for path in sys.argv[1:]:
+    for path in args.fonts:
         if os.path.isfile(path) and path.lower().endswith((".ttf", ".otf")):
             base = os.path.basename(path)
             if not base.endswith(tuple(s + ext for s in valid_suffixes for ext in (".ttf", ".otf"))):
                 invalid_files.append(base)
+        else:
+            print(f"Skipping non-TTF/OTF file: {path}")
 
     if invalid_files:
-        print("ERROR: The following fonts have invalid filenames (must end with -Regular, -Bold, -Italic, or -BoldItalic):")
+        print(
+            "ERROR: The following fonts have invalid filenames (must end with -Regular, -Bold, -Italic, or -BoldItalic):"
+        )
         for f in invalid_files:
             print("  " + f)
         sys.exit(1)
 
-    for path in sys.argv[1:]:
+    # --------------------------
+    # Process each font
+    # --------------------------
+    for path in args.fonts:
         if os.path.isfile(path) and path.lower().endswith((".ttf", ".otf")):
-            process_font(path)
-        else:
-            print(f"Skipping non-TTF/OTF file: {path}")
+            process_font(path, new_name=args.name)
 
 
 if __name__ == "__main__":

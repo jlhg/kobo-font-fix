@@ -355,6 +355,23 @@ class FontProcessor:
                     except Exception as e:
                         logger.warning(f"  Failed to update name ID 4: {e}")
 
+        # --- Update Subfamily Name (nameID 2) and Preferred Subfamily (nameID 17) ---        
+        for record in name_table.names:
+            if record.nameID in {2, 17}:
+                try:
+                    current_name = record.toUnicode()
+                    if current_name != metadata.style_name:
+                        record.string = metadata.style_name.encode(record.getEncoding())
+                        logger.info(f"  Name ID {record.nameID} updated: '{current_name}'->'{metadata.style_name}'")
+                    else:
+                        logger.info(f"  Name ID {record.nameID} is already correct")
+                except Exception:
+                    try:
+                        record.string = metadata.style_name.encode("utf_16_be")
+                        logger.info(f"  Name ID {record.nameID} updated with UTF-16 BE encoding")
+                    except Exception as e:
+                        logger.warning(f"  Failed to update name ID {record.nameID}: {e}")
+
         # --- Update Unique ID (nameID 3) ---
         for record in name_table.names:
             if record.nameID == 3:  # Unique ID

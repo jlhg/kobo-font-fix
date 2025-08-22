@@ -8,6 +8,10 @@ It generates a renamed font, fixes PANOSE information based on the filename, adj
 
 You can use this to modify or fix your own, legally acquired fonts (assuming you are permitted to do so).
 
+## License
+
+Licensed under the [MIT License](/LICENSE).
+
 ## Requirements
 
 Python 3, FontTools, `font-line`.
@@ -54,6 +58,8 @@ By default, the script will:
 6. **Kern pairs from the GPOS table are copied to the legacy `kern` table.** This only applies to fonts that have a GPOS table, which is used for kerning in modern fonts.
 7. **The `font-line` helper is used to apply a 20% line-height setting.** This generates a new file which is immediately renamed to the desired output format.
 
+The modified fonts are saved in the directory where the original fonts are located.
+
 ## Customization
 
 You can customize what the script does. For more information, consult:
@@ -94,6 +100,47 @@ To process all fonts with the "Kobo Fix" preset, simply run:
 
 (In this case, we'll set --line-percent to 0 so the line height changes aren't made, because the fonts in the NV Collection should already have those changes applied.)
 
+The expected output is then:
+
+```
+nico@m1ni kobo-font-fix % ./kobofix.py --prefix KF --remove-prefix NV *.ttf --line-percent 0
+
+Processing: NV-Elstob-Bold.ttf
+  --remove-prefix enabled: using 'Elstob' as the new family name.
+  Renaming the font to: KF Elstob Bold
+  PANOSE corrected: bWeight 8->8, bLetterForm 2->2
+  Kerning: extracted 342467 pairs; wrote 342467 to legacy 'kern' table.
+  Saved: KF_Elstob-Bold.ttf
+  Skipping line adjustment step.
+
+Processing: NV-Elstob-BoldItalic.ttf
+  --remove-prefix enabled: using 'Elstob' as the new family name.
+  Renaming the font to: KF Elstob Bold Italic
+  PANOSE corrected: bWeight 8->8, bLetterForm 3->3
+  Kerning: extracted 300746 pairs; wrote 300746 to legacy 'kern' table.
+  Saved: KF_Elstob-BoldItalic.ttf
+  Skipping line adjustment step.
+
+Processing: NV-Elstob-Italic.ttf
+  --remove-prefix enabled: using 'Elstob' as the new family name.
+  Renaming the font to: KF Elstob Italic
+  PANOSE corrected: bWeight 5->5, bLetterForm 3->3
+  Kerning: extracted 286857 pairs; wrote 286856 to legacy 'kern' table.
+  Saved: KF_Elstob-Italic.ttf
+  Skipping line adjustment step.
+
+Processing: NV-Elstob-Regular.ttf
+  --remove-prefix enabled: using 'Elstob' as the new family name.
+  Renaming the font to: KF Elstob
+  PANOSE corrected: bWeight 5->5, bLetterForm 2->2
+  Kerning: extracted 313998 pairs; wrote 313998 to legacy 'kern' table.
+  Saved: KF_Elstob-Regular.ttf
+  Skipping line adjustment step.
+
+==================================================
+Processed 4/4 fonts successfully.
+```
+
 ### Generating NV fonts
 
 Tight spacing, with a custom font family name:
@@ -109,7 +156,3 @@ Relaxed spacing, with a custom font family name:
 ```
 
 You can play around with `--line-percent` to see what works for you.
-
-## License
-
-Licensed under the [MIT License](/LICENSE).

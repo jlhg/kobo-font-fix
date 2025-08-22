@@ -2,6 +2,9 @@
 
 ## Overview
 
+> [!WARNING]
+> Currently, the `kern` table workaround does not appear to work correctly and requires further investigation. This script is still under development.
+
 `kobofix.py` is a Python script designed to process TTF fonts for Kobo e-readers. 
 
 It generates a renamed font, fixes PANOSE information based on the filename, adjusts the baseline with the `font-line` utility, and adds a legacy `kern` table which allows the `kepub` engine for improved rendering of kerned pairs.

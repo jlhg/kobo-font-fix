@@ -341,30 +341,32 @@ class FontProcessor:
     def add_legacy_kern(font: TTFont, kern_pairs: Dict[Tuple[str, str], int]) -> int:
         """
         Create or replace a legacy 'kern' table with the supplied pairs.
-        Older devices like some Kobo models only recognize the 'kern' table.
-        This function creates a new `kern` table from the extracted GPOS pairs.
+        Splits into multiple subtables if there are more than 10,000 pairs.
         """
         if not kern_pairs:
             return 0
-        
+
         kern_table = newTable("kern")
         kern_table.version = 0
         kern_table.kernTables = []
-        
-        subtable = KernTable_format_0()
-        subtable.version = 0
-        subtable.length = None
-        subtable.coverage = 1
-        subtable.kernTable = {
-            tuple(k): int(v) 
-            for k, v in kern_pairs.items() 
-            if v
-        }
-        kern_table.kernTables.append(subtable)
+
+        # Max pairs per subtable
+        MAX_PAIRS = 10000
+        items = [(tuple(k), int(v)) for k, v in kern_pairs.items() if v]
+
+        for i in range(0, len(items), MAX_PAIRS):
+            chunk = dict(items[i:i + MAX_PAIRS])
+            subtable = KernTable_format_0()
+            subtable.version = 0
+            subtable.length = None
+            subtable.coverage = 1
+            subtable.kernTable = chunk
+            kern_table.kernTables.append(subtable)
+
         font["kern"] = kern_table
-        
-        return len(subtable.kernTable)
-    
+
+        return len(items)
+
     # ============================================================
     # Name table methods
     # ============================================================

@@ -2,9 +2,6 @@
 
 ## Overview
 
-> [!WARNING]
-> Currently, the `kern` table workaround does not appear to work correctly and requires further investigation. This script is still under development.
-
 `kobofix.py` is a Python script designed to process TTF fonts for Kobo e-readers. 
 
 It generates a renamed font, fixes PANOSE information based on the filename, adjusts the baseline with the `font-line` utility, and adds a legacy `kern` table which allows the `kepub` engine for improved rendering of kerned pairs.
@@ -64,8 +61,10 @@ To process fonts from my [ebook-fonts](https://github.com/nicoverbruggen/ebook-f
 To process all fonts with the "Kobo Fix" preset, simply run:
 
 ```bash
-./kobofix.py --prefix KF --remove-prefix="NV" --line-percent 20 *.ttf
+./kobofix.py --prefix KF --remove-prefix="NV" --line-percent 0 *.ttf
 ```
+
+(In this case, we'll set --line-percent to 0 so the line height changes aren't made, because the fonts in the NV Collection should already have those changes applied.)
 
 ### Generating NV fonts
 
